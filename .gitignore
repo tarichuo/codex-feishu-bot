@@ -1,0 +1,7 @@
+.venv/
+tmp_runtime/
+.pytest_cache/
+.env
+env.sh
+**__pycache__
+var

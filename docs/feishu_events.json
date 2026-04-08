@@ -1,0 +1,29 @@
+{
+  "category": "events",
+  "importSupport": {
+    "officiallyConfirmed": false,
+    "status": "manual_configuration_required",
+    "reason": "当前未在飞书官方公开资料中确认到事件订阅支持通过与权限配置相同的 JSON 方式直接批量导入。"
+  },
+  "events": [
+    {
+      "name": "im.message.receive_v1",
+      "required": true,
+      "purpose": "接收单聊消息和群聊中 @ 机器人的消息，进入会话编排、slash 命令路由、流式回复与审批文本协议处理。",
+      "codeReferences": [
+        "src/feishu_codex_bot/adapters/feishu_adapter.py:82",
+        "src/feishu_codex_bot/runtime.py:151"
+      ]
+    },
+    {
+      "name": "im.chat.member.bot.added_v1",
+      "required": true,
+      "purpose": "机器人被拉入群时初始化该群的持久 thread。",
+      "uiLabel": "订阅机器人进、出群事件",
+      "codeReferences": [
+        "src/feishu_codex_bot/adapters/feishu_adapter.py:85",
+        "src/feishu_codex_bot/runtime.py:202"
+      ]
+    }
+  ]
+}

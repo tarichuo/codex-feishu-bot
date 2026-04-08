@@ -1,0 +1,30 @@
+{
+  "category": "callback",
+  "importSupport": {
+    "officiallyConfirmed": false,
+    "status": "manual_configuration_required",
+    "reason": "当前未在飞书官方公开资料中确认到长连接接收方式或回调方式支持通过 JSON 直接导入。"
+  },
+  "deliveryMode": {
+    "type": "long_connection",
+    "providerLabel": "使用长连接接收事件（WebSocket）",
+    "required": true,
+    "purpose": "机器人通过长连接从飞书后台接收事件，不依赖公网 HTTP 回调地址。"
+  },
+  "httpCallback": {
+    "enabled": false,
+    "requestUrl": null,
+    "verificationToken": null,
+    "encryptKey": null,
+    "reason": "当前项目不使用公网事件回调。"
+  },
+  "interactiveCardCallback": {
+    "enabled": false,
+    "requestUrl": null,
+    "reason": "当前项目未实现卡片交互回调，审批和补充输入通过文本协议 /approve 与 /input 处理。"
+  },
+  "codeReferences": [
+    "src/feishu_codex_bot/adapters/feishu_adapter.py:71",
+    "src/feishu_codex_bot/adapters/feishu_adapter.py:95"
+  ]
+}

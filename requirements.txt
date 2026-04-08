@@ -1,0 +1,5 @@
+# Current confirmed runtime dependency.
+# Add more packages in later tasks when their usage is implemented.
+lark-oapi>=1.4,<2.0
+websockets>=16,<17
+pytest>=8,<9

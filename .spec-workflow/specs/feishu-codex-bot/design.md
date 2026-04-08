@@ -103,6 +103,8 @@ Outbound Renderer
 1. `config`
    - 读取环境变量
    - 组装飞书、Codex、SQLite、日志、临时文件目录、owner 和白名单等配置
+   - 维护与项目运行方式一致的依赖清单输出约定，例如 `requirements.txt`
+   - 约定开发和运行统一使用仓库根目录下的 `.venv`
 
 2. `feishu_adapter`
    - 建立飞书长连接
@@ -722,6 +724,8 @@ Codex 可能通过 JSON-RPC 反向请求用户批准或补充信息。
 ## 11. 目录结构建议
 
 ```text
+.venv/
+requirements.txt
 src/feishu_codex_bot/
   __init__.py
   app.py
