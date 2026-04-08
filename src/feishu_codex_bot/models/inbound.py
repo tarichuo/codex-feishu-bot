@@ -151,3 +151,29 @@ class DownloadedMedia:
 
 
 InboundEvent: TypeAlias = InboundMessage | BotAddedEvent
+
+
+@dataclass(frozen=True, slots=True)
+class CardActionCallback:
+    event_id: str | None
+    event_type: str | None
+    tenant_key: str | None
+    app_id: str | None
+    operator_open_id: str | None
+    operator_user_id: str | None
+    operator_union_id: str | None
+    open_message_id: str | None
+    open_chat_id: str | None
+    action_tag: str | None
+    action_name: str | None
+    action_value: dict[str, str]
+    form_value: dict[str, str]
+    input_value: str | None
+    occurred_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CardActionCallbackResult:
+    toast_type: str
+    toast_text: str
+    card_payload: dict[str, object] | None = None

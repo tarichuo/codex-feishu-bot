@@ -87,10 +87,12 @@ class ApprovalService:
 
         action_type = self._action_type_for_request(request)
         prompt_text, status = self._build_prompt(request=request, context=context)
+        prompt_card = self._build_pending_approval_card(request=request, prompt_text=prompt_text)
         prompt_message_id = self._send_prompt_message(
             request=request,
             source_message_id=context.source_message_id,
             text=prompt_text,
+            card_payload=prompt_card,
             reply_in_thread=context.reply_in_thread,
         )
         payload = {
@@ -332,12 +334,13 @@ class ApprovalService:
         request: CodexServerRequest,
         source_message_id: str,
         text: str,
+        card_payload: dict[str, object] | None,
         reply_in_thread: bool,
     ) -> str:
         if request.method in _APPROVAL_METHODS:
             return self._feishu_adapter.send_approval_message(
                 message_id=source_message_id,
-                text=text,
+                card_payload=card_payload or self._build_fallback_info_card("审批请求", text),
                 reply_in_thread=reply_in_thread,
             )
         return self._feishu_adapter.send_user_input_message(
@@ -434,25 +437,33 @@ class ApprovalService:
         if not record.feishu_message_id:
             return
         response = record.payload.get("response")
-        summary = "\n".join(
-            (
-                "该请求已处理",
-                f"request_id: {record.request_id}",
-                f"status: {record.status}",
-                f"response: {json.dumps(response, ensure_ascii=False)}",
-            )
-        )
         method = record.payload.get("method")
-        if method in _APPROVAL_METHODS:
-            self._feishu_adapter.update_approval_message(
+        try:
+            if method in _APPROVAL_METHODS:
+                self._feishu_adapter.update_approval_message(
+                    message_id=record.feishu_message_id,
+                    card_payload=self.build_resolved_approval_card(record),
+                )
+                return
+            summary = "\n".join(
+                (
+                    "该请求已处理",
+                    f"request_id: {record.request_id}",
+                    f"status: {record.status}",
+                    f"response: {json.dumps(response, ensure_ascii=False)}",
+                )
+            )
+            self._feishu_adapter.update_user_input_message(
                 message_id=record.feishu_message_id,
                 text=summary,
             )
-            return
-        self._feishu_adapter.update_user_input_message(
-            message_id=record.feishu_message_id,
-            text=summary,
-        )
+        except Exception:
+            self._logger.bind(
+                event="approval.prompt_update_failed",
+                request_id=record.request_id,
+                status=record.status,
+                feishu_message_id=record.feishu_message_id,
+            ).exception("Failed to update Feishu prompt after approval response")
 
     def _status_from_approval_response(
         self,
@@ -508,3 +519,173 @@ class ApprovalService:
         if isinstance(network, dict) and "enabled" in network:
             chunks.append(f"network_enabled={network.get('enabled')}")
         return "; ".join(chunks) if chunks else "-"
+
+    def build_resolved_approval_card(self, record: PendingActionRecord) -> dict[str, object]:
+        payload = record.payload
+        prompt_text = str(payload.get("promptText") or f"request_id: {record.request_id}")
+        response_text = json.dumps(payload.get("response"), ensure_ascii=False)
+        status_label, template = self._approval_status_meta(record.status)
+        content = "\n\n".join(
+            (
+                prompt_text,
+                f"**处理状态**: {status_label}",
+                f"**response**: `{response_text}`",
+            )
+        )
+        return self._build_fallback_info_card(
+            title="审批已处理",
+            text=content,
+            template=template,
+        )
+
+    def build_card_action_not_found_card(self, request_id: str) -> dict[str, object]:
+        return self._build_fallback_info_card(
+            title="审批请求不存在",
+            text=f"request_id: {request_id}\n\n该审批请求不存在，或已被清理。",
+            template="grey",
+        )
+
+    def _build_pending_approval_card(
+        self,
+        *,
+        request: CodexServerRequest,
+        prompt_text: str,
+    ) -> dict[str, object]:
+        if request.method not in _APPROVAL_METHODS:
+            return self._build_fallback_info_card("请求处理", prompt_text)
+        return {
+            "schema": "2.0",
+            "config": {
+                "wide_screen_mode": True,
+            },
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": self._approval_title_for_method(request.method),
+                },
+                "template": "orange",
+            },
+            "body": {
+                "direction": "vertical",
+                "padding": "12px 12px 12px 12px",
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": prompt_text,
+                    },
+                    *self._build_approval_buttons(request),
+                ],
+            },
+        }
+
+    def _build_approval_buttons(self, request: CodexServerRequest) -> list[dict[str, object]]:
+        request_id = str(request.id)
+        base_value = {
+            "kind": "approval",
+            "request_id": request_id,
+        }
+        if request.method == "item/permissions/requestApproval":
+            return [
+                self._build_approval_button(
+                    text="同意",
+                    button_type="primary",
+                    value={**base_value, "decision": "accept", "scope": "session"},
+                ),
+                self._build_approval_button(
+                    text="拒绝",
+                    button_type="default",
+                    value={**base_value, "decision": "decline", "scope": "session"},
+                ),
+            ]
+        return [
+            self._build_approval_button(
+                text="同意",
+                button_type="primary",
+                value={**base_value, "decision": "accept", "scope": "turn"},
+            ),
+            self._build_approval_button(
+                text="本会话内同意",
+                button_type="primary",
+                value={**base_value, "decision": "acceptForSession", "scope": "session"},
+            ),
+            self._build_approval_button(
+                text="拒绝",
+                button_type="default",
+                value={**base_value, "decision": "decline", "scope": "turn"},
+            ),
+            self._build_approval_button(
+                text="取消",
+                button_type="default",
+                value={**base_value, "decision": "cancel", "scope": "turn"},
+            ),
+        ]
+
+    def _build_approval_button(
+        self,
+        *,
+        text: str,
+        button_type: str,
+        value: dict[str, str],
+    ) -> dict[str, object]:
+        return {
+            "tag": "button",
+            "type": button_type,
+            "text": {
+                "tag": "plain_text",
+                "content": text,
+            },
+            "behaviors": [
+                {
+                    "type": "callback",
+                    "value": value,
+                }
+            ],
+        }
+
+    def _approval_title_for_method(self, method: str) -> str:
+        mapping = {
+            "item/commandExecution/requestApproval": "Codex 请求命令审批",
+            "item/fileChange/requestApproval": "Codex 请求文件变更审批",
+            "item/permissions/requestApproval": "Codex 请求权限审批",
+        }
+        return mapping.get(method, "Codex 请求审批")
+
+    def _approval_status_meta(self, status: str) -> tuple[str, str]:
+        if status == "approved":
+            return "已同意", "green"
+        if status == "rejected":
+            return "已拒绝", "red"
+        if status == "cancelled":
+            return "已取消", "grey"
+        return status, "grey"
+
+    def _build_fallback_info_card(
+        self,
+        title: str,
+        text: str,
+        *,
+        template: str = "blue",
+    ) -> dict[str, object]:
+        return {
+            "schema": "2.0",
+            "config": {
+                "wide_screen_mode": True,
+            },
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": title,
+                },
+                "template": template,
+            },
+            "body": {
+                "direction": "vertical",
+                "padding": "12px 12px 12px 12px",
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": text,
+                    }
+                ],
+            },
+        }

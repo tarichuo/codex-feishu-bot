@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 import json
 import shlex
@@ -14,9 +14,16 @@ from feishu_codex_bot.bootstrap import RuntimeContext, bootstrap_runtime
 from feishu_codex_bot.config import ConfigError
 from feishu_codex_bot.logging import ContextLoggerAdapter
 from feishu_codex_bot.models.actions import CodexNotification, CodexServerRequest
-from feishu_codex_bot.models.inbound import BotAddedEvent, InboundMessage, TextContent
+from feishu_codex_bot.models.inbound import (
+    BotAddedEvent,
+    CardActionCallback,
+    CardActionCallbackResult,
+    InboundMessage,
+    TextContent,
+)
 from feishu_codex_bot.persistence.action_repo import PendingActionRecord
 from feishu_codex_bot.services.approval_service import ApprovalRequestContext
+from feishu_codex_bot.services.security_service import UnauthorizedMessage
 
 
 _ACTIVE_TURN_BUSY_MESSAGE = "当前会话仍有进行中的回复，请等待本轮完成后再发送新消息。"
@@ -111,6 +118,7 @@ class ApplicationRuntime:
             self._context.feishu_adapter.start_long_connection(
                 on_message=self._handle_feishu_message_sync,
                 on_bot_added=self._handle_feishu_bot_added_sync,
+                on_card_action=self._handle_feishu_card_action_sync,
             )
         except Exception:
             self._logger.bind(event="runtime.feishu_thread.failed").exception(
@@ -129,6 +137,42 @@ class ApplicationRuntime:
             self._handle_feishu_bot_added(event),
             description=f"feishu_bot_added:{event.chat_id}",
         )
+
+    def _handle_feishu_card_action_sync(
+        self,
+        action: CardActionCallback,
+    ) -> CardActionCallbackResult:
+        if self._loop is None:
+            return CardActionCallbackResult(
+                toast_type="error",
+                toast_text="应用尚未初始化完成，请稍后重试。",
+            )
+        future = asyncio.run_coroutine_threadsafe(
+            self._handle_feishu_card_action(action),
+            self._loop,
+        )
+        try:
+            return future.result(timeout=2.8)
+        except FutureTimeoutError:
+            self._logger.bind(
+                event="runtime.card_action.timeout",
+                request_id=action.action_value.get("request_id"),
+                operator_open_id=action.operator_open_id,
+            ).warning("Card action handling timed out")
+            return CardActionCallbackResult(
+                toast_type="warning",
+                toast_text="处理超时，请稍后查看卡片状态。",
+            )
+        except Exception:
+            self._logger.bind(
+                event="runtime.card_action.failed",
+                request_id=action.action_value.get("request_id"),
+                operator_open_id=action.operator_open_id,
+            ).exception("Failed to handle Feishu card action")
+            return CardActionCallbackResult(
+                toast_type="error",
+                toast_text="处理审批按钮失败，请稍后重试。",
+            )
 
     def _schedule_coroutine(self, coroutine: asyncio.Future | asyncio.Task | object, *, description: str) -> None:
         if self._loop is None:
@@ -201,6 +245,72 @@ class ApplicationRuntime:
 
     async def _handle_feishu_bot_added(self, event: BotAddedEvent) -> None:
         await self._context.conversation_service.handle_bot_added(event)
+
+    async def _handle_feishu_card_action(
+        self,
+        action: CardActionCallback,
+    ) -> CardActionCallbackResult:
+        sender_id = (
+            action.operator_open_id
+            or action.operator_user_id
+            or action.operator_union_id
+        )
+        if sender_id is None:
+            return CardActionCallbackResult(
+                toast_type="error",
+                toast_text="无法识别操作人，审批未执行。",
+            )
+
+        if sender_id not in self._context.config.security.allowed_user_ids:
+            await self._handle_unauthorized_card_action(action=action, sender_id=sender_id)
+            return CardActionCallbackResult(
+                toast_type="warning",
+                toast_text="你不在允许操作该机器人的白名单中。",
+            )
+
+        action_value = action.action_value
+        if action_value.get("kind") != "approval":
+            return CardActionCallbackResult(
+                toast_type="warning",
+                toast_text="暂不支持此卡片交互。",
+            )
+
+        request_id = action_value.get("request_id")
+        if not request_id:
+            return CardActionCallbackResult(
+                toast_type="error",
+                toast_text="审批请求缺少 request_id。",
+            )
+
+        record = self._context.approval_service.get_pending_action(request_id)
+        if record is None:
+            return CardActionCallbackResult(
+                toast_type="warning",
+                toast_text=f"审批请求 {request_id} 不存在。",
+                card_payload=self._context.approval_service.build_card_action_not_found_card(
+                    request_id
+                ),
+            )
+
+        if record.status != "pending":
+            return CardActionCallbackResult(
+                toast_type="info",
+                toast_text=f"审批请求 {request_id} 已处理。",
+                card_payload=self._context.approval_service.build_resolved_approval_card(record),
+            )
+
+        decision = action_value.get("decision") or "decline"
+        scope = action_value.get("scope") or "turn"
+        updated = await self._context.approval_service.submit_approval_response(
+            request_id,
+            decision,
+            scope=scope,
+        )
+        return CardActionCallbackResult(
+            toast_type="success",
+            toast_text=f"审批请求 {updated.request_id} 已处理，状态: {updated.status}",
+            card_payload=self._context.approval_service.build_resolved_approval_card(updated),
+        )
 
     async def _handle_codex_notification(self, notification: CodexNotification) -> None:
         try:
@@ -464,6 +574,58 @@ class ApplicationRuntime:
         if message.is_direct_message:
             return True
         return bool(message.mentions)
+
+    async def _handle_unauthorized_card_action(
+        self,
+        *,
+        action: CardActionCallback,
+        sender_id: str,
+    ) -> None:
+        alert = self._context.security_service.record_unauthorized_attempt(
+            UnauthorizedMessage(
+                bot_app_id=self._context.config.feishu.app_id,
+                sender_user_id=sender_id,
+                sender_open_id=action.operator_open_id,
+                chat_id=action.open_chat_id,
+                chat_type="card_callback",
+                feishu_message_id=action.open_message_id or "",
+                feishu_event_id=action.event_id,
+            )
+        )
+        alert_text = "\n".join(
+            (
+                "检测到非白名单用户尝试点击审批卡片",
+                f"时间: {action.occurred_at.isoformat()}",
+                f"发送者: {sender_id}",
+                f"chat_id: {action.open_chat_id or '-'}",
+                f"message_id: {action.open_message_id or '-'}",
+                f"request_id: {action.action_value.get('request_id') or '-'}",
+            )
+        )
+        try:
+            owner_alert_message_id = self._context.feishu_adapter.send_owner_alert(
+                owner_open_id=self._context.config.security.owner_user_id,
+                text=alert_text,
+            )
+        except Exception:
+            self._context.security_service.mark_alert_failed(alert.id)
+            self._logger.bind(
+                event="runtime.card_action.security.alert_failed",
+                sender_id=sender_id,
+                request_id=action.action_value.get("request_id"),
+            ).exception("Failed to deliver owner alert for unauthorized card action")
+            return
+
+        self._context.security_service.mark_alert_sent(
+            alert.id,
+            owner_alert_message_id=owner_alert_message_id,
+        )
+        self._logger.bind(
+            event="runtime.card_action.security.blocked",
+            sender_id=sender_id,
+            request_id=action.action_value.get("request_id"),
+            owner_alert_message_id=owner_alert_message_id,
+        ).warning("Blocked unauthorized card action and sent owner alert")
 
 
 async def run_application() -> None:

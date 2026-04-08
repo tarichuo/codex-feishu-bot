@@ -65,6 +65,7 @@
 
 - 使用长连接接收事件
 - 不使用公网 HTTP callback URL
+- 使用长连接接收交互卡片回调
 - 不使用卡片交互回调 URL
 
 当前结论：
@@ -79,7 +80,8 @@
 2. 导入 [feishu_app_permissions.json](./feishu_app_permissions.json)
 3. 按 [feishu_callback.json](./feishu_callback.json) 配置长连接接收方式
 4. 按 [feishu_events.json](./feishu_events.json) 勾选必需事件
-5. 创建版本并发布
+5. 在“回调配置 / 卡片回调”中启用 `card.action.trigger`，接收方式同样选择长连接
+6. 创建版本并发布
 
 ## 5. 说明
 

@@ -10,11 +10,12 @@
 
 | 权限范围 | 当前用途 | 代码位置 |
 | --- | --- | --- |
+| `cardkit:card:write` | 通过 CardKit 将同一条回复卡片持续流式刷新 | `src/feishu_codex_bot/adapters/feishu_adapter.py` |
 | `im:message` | 接收和发送消息的基础权限 | `src/feishu_codex_bot/adapters/feishu_adapter.py` |
 | `im:message.p2p_msg:readonly` | 接收机器人单聊消息 | `src/feishu_codex_bot/adapters/feishu_adapter.py:82` |
 | `im:message.group_at_msg:readonly` | 接收群聊中 `@` 机器人的消息 | `src/feishu_codex_bot/adapters/feishu_adapter.py:82` |
 | `im:message:send_as_bot` | 机器人发送文本、图片、文件、单聊告警和回复消息 | `src/feishu_codex_bot/adapters/feishu_adapter.py:181`, `src/feishu_codex_bot/adapters/feishu_adapter.py:223`, `src/feishu_codex_bot/adapters/feishu_adapter.py:324` |
-| `im:message:update` | 将同一条飞书回复消息持续更新为流式输出 | `src/feishu_codex_bot/adapters/feishu_adapter.py:265` |
+| `im:message:update` | 更新审批消息和补充输入消息的文本内容 | `src/feishu_codex_bot/adapters/feishu_adapter.py:265` |
 | `im:message.reactions:write_only` | 给原消息添加并撤销“敲键盘”表情 | `src/feishu_codex_bot/adapters/feishu_adapter.py:287`, `src/feishu_codex_bot/adapters/feishu_adapter.py:310` |
 | `im:resource` | 上传/下载图片和文件，支持图片接收、本地落盘、再发送图片/文件 | `src/feishu_codex_bot/services/media_service.py:67`, `src/feishu_codex_bot/services/media_service.py:86`, `src/feishu_codex_bot/services/media_service.py:105`, `src/feishu_codex_bot/services/media_service.py:130` |
 
@@ -32,11 +33,13 @@
 - 接收方式：选择“使用长连接接收事件（WebSocket）”
 - 事件一：`im.message.receive_v1`
 - 事件二：`im.chat.member.bot.added_v1`
+- 卡片回调：`card.action.trigger`，接收方式同样选择长连接
 
 它们分别对应当前代码中的两条主流程：
 
 - 接收消息事件会进入消息编排、slash 命令路由、流式回复和审批文本协议处理：`src/feishu_codex_bot/adapters/feishu_adapter.py:82`, `src/feishu_codex_bot/runtime.py:151`
 - 机器人进群事件会初始化群聊 thread：`src/feishu_codex_bot/adapters/feishu_adapter.py:85`, `src/feishu_codex_bot/runtime.py:202`
+- 审批卡片按钮点击会触发 `card.action.trigger`，并直接回传给 Codex 审批桥接：`src/feishu_codex_bot/adapters/feishu_adapter.py`, `src/feishu_codex_bot/runtime.py`
 
 ## 3. 事件相关权限说明
 
@@ -61,8 +64,8 @@
   - 当前没有撤回消息功能。
 - `im:message.reactions:read`
   - 当前只创建和删除表情，不读取表情列表。
-- 卡片交互、审批卡片回调相关权限
-  - 当前审批/补充输入走文本协议 `/approve` 和 `/input`，没有实现交互卡片回调。
+- 卡片交互回调相关权限
+  - 当前审批交互使用的是开放平台回调配置 `card.action.trigger`，不是额外的租户 scope。
 - 群成员、群信息查询相关权限
   - 当前不调用群成员列表或群详情接口。
 

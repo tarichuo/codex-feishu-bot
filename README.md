@@ -7,7 +7,7 @@
 - 支持单聊与群聊两种会话模式
 - 单聊会话 1 小时过期，群聊会话长期复用同一个 thread
 - 支持 `/clear`、`/model`、`/compact`、`/init` 四个 slash 命令透传
-- 飞书侧单条消息流式更新回复内容
+- 飞书侧通过 CardKit 卡片流式更新单条回复内容
 - 回复期间给原消息添加“敲键盘”表情，结束后撤销
 - 支持图片接收、下载到本地后转发给 Codex
 - 支持图片与文件从本地上传后发回飞书
@@ -90,7 +90,7 @@ feishu-codex-bot
 当前仓库提供离线单元测试，不依赖真实飞书服务和真实 Codex 服务：
 
 ```bash
-PYTHONPATH=src python3 -m pytest tests/test_conversation_service.py tests/test_security_service.py
+PYTHONPATH=src python3 -m pytest tests/test_conversation_service.py tests/test_security_service.py tests/test_reply_service.py
 ```
 
 ## 调试建议

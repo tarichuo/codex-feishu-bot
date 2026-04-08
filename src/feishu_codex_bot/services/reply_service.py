@@ -32,12 +32,14 @@ class _ReplyStreamState:
     session_scope_key: str
     source_message_id: str
     reply_message_id: str
+    reply_card_id: str
     thread_id: str
     turn_id: str
     reply_in_thread: bool
     reaction_id: str | None
     placeholder_text: str
     last_sent_text: str
+    next_sequence: int
     aggregated_text: str = ""
     agent_item_id: str | None = None
     status: ReplyStreamStatus = "streaming"
@@ -89,10 +91,11 @@ class ReplyService:
 
         reaction_id: str | None = None
         try:
-            reply_message_id = self._feishu_adapter.reply_text(
+            reply_card = self._feishu_adapter.reply_streaming_card(
                 message_id=source_message_id,
                 text=self._placeholder_text,
                 reply_in_thread=reply_in_thread,
+                status="streaming",
             )
             try:
                 reaction_id = self._feishu_adapter.add_reaction(
@@ -110,7 +113,7 @@ class ReplyService:
             record = self._reply_repository.create_reply(
                 bot_app_id=self._config.feishu.app_id,
                 feishu_message_id=source_message_id,
-                reply_message_id=reply_message_id,
+                reply_message_id=reply_card.message_id,
                 thread_id=thread_id,
                 turn_id=turn_id,
                 status="streaming",
@@ -119,20 +122,23 @@ class ReplyService:
             state = _ReplyStreamState(
                 session_scope_key=session_scope_key,
                 source_message_id=source_message_id,
-                reply_message_id=reply_message_id,
+                reply_message_id=reply_card.message_id,
+                reply_card_id=reply_card.card_id,
                 thread_id=thread_id,
                 turn_id=turn_id,
                 reply_in_thread=reply_in_thread,
                 reaction_id=reaction_id,
                 placeholder_text=self._placeholder_text,
                 last_sent_text=self._placeholder_text,
+                next_sequence=2,
             )
             self._streams_by_turn[turn_id] = state
             self._logger.bind(
                 event="reply.turn.started",
                 session_scope_key=session_scope_key,
                 feishu_message_id=source_message_id,
-                reply_message_id=reply_message_id,
+                reply_message_id=reply_card.message_id,
+                reply_card_id=reply_card.card_id,
                 thread_id=thread_id,
                 turn_id=turn_id,
                 reaction_applied=reaction_id is not None,
@@ -267,11 +273,16 @@ class ReplyService:
             if not force and (not state.dirty or target_text == state.last_sent_text):
                 return
             state.dirty = False
+            sequence = state.next_sequence
+            state.next_sequence += 1
+            status = state.status
 
         try:
-            self._feishu_adapter.update_text(
-                message_id=state.reply_message_id,
+            self._feishu_adapter.update_streaming_card(
+                card_id=state.reply_card_id,
                 text=target_text,
+                status=status,
+                sequence=sequence,
             )
         except Exception:
             async with state.lock:
@@ -281,6 +292,7 @@ class ReplyService:
                 event="reply.flush.failed",
                 session_scope_key=state.session_scope_key,
                 reply_message_id=state.reply_message_id,
+                reply_card_id=state.reply_card_id,
                 turn_id=state.turn_id,
             ).exception("Failed to update streaming reply message")
             if force:
@@ -302,6 +314,7 @@ class ReplyService:
             event="reply.flushed",
             session_scope_key=state.session_scope_key,
             reply_message_id=state.reply_message_id,
+            reply_card_id=state.reply_card_id,
             turn_id=state.turn_id,
             text_length=len(target_text),
             force=force,
@@ -340,6 +353,7 @@ class ReplyService:
                 event="reply.finalize.flush_failed",
                 session_scope_key=state.session_scope_key,
                 reply_message_id=state.reply_message_id,
+                reply_card_id=state.reply_card_id,
                 turn_id=state.turn_id,
                 status=status,
             ).exception("Failed to flush final reply text")
@@ -375,6 +389,7 @@ class ReplyService:
             event="reply.turn.finalized",
             session_scope_key=state.session_scope_key,
             reply_message_id=state.reply_message_id,
+            reply_card_id=state.reply_card_id,
             thread_id=state.thread_id,
             turn_id=state.turn_id,
             status=status,

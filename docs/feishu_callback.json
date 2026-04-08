@@ -19,12 +19,17 @@
     "reason": "当前项目不使用公网事件回调。"
   },
   "interactiveCardCallback": {
-    "enabled": false,
+    "enabled": true,
     "requestUrl": null,
-    "reason": "当前项目未实现卡片交互回调，审批和补充输入通过文本协议 /approve 与 /input 处理。"
+    "deliveryMode": "long_connection",
+    "subscribedCallbacks": [
+      "card.action.trigger"
+    ],
+    "reason": "审批请求通过交互卡片按钮处理，卡片交互回调也通过长连接接收，不依赖公网 HTTP URL。"
   },
   "codeReferences": [
-    "src/feishu_codex_bot/adapters/feishu_adapter.py:71",
-    "src/feishu_codex_bot/adapters/feishu_adapter.py:95"
+    "src/feishu_codex_bot/adapters/feishu_adapter.py:77",
+    "src/feishu_codex_bot/adapters/feishu_adapter.py:101",
+    "src/feishu_codex_bot/runtime.py:102"
   ]
 }

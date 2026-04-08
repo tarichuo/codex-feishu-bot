@@ -1,6 +1,7 @@
 {
   "scopes": {
     "tenant": [
+      "cardkit:card:write",
       "im:message",
       "im:message.p2p_msg:readonly",
       "im:message.group_at_msg:readonly",

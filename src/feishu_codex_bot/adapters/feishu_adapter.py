@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 import json
 import uuid
 
 import lark_oapi as lark
+from lark_oapi.api.cardkit.v1.model.content_card_element_request import (
+    ContentCardElementRequest,
+)
+from lark_oapi.api.cardkit.v1.model.content_card_element_request_body import (
+    ContentCardElementRequestBody,
+)
+from lark_oapi.api.cardkit.v1.model.create_card_request import CreateCardRequest
+from lark_oapi.api.cardkit.v1.model.create_card_request_body import CreateCardRequestBody
+from lark_oapi.api.cardkit.v1.model.settings_card_request import SettingsCardRequest
+from lark_oapi.api.cardkit.v1.model.settings_card_request_body import SettingsCardRequestBody
 from lark_oapi.api.im.v1.model.create_message_reaction_request import CreateMessageReactionRequest
 from lark_oapi.api.im.v1.model.create_message_reaction_request_body import (
     CreateMessageReactionRequestBody,
@@ -23,11 +34,19 @@ from lark_oapi.api.im.v1.model.update_message_request import UpdateMessageReques
 from lark_oapi.api.im.v1.model.update_message_request_body import UpdateMessageRequestBody
 from lark_oapi.core.enum import LogLevel
 from lark_oapi.core.model import BaseResponse
+from lark_oapi.event.callback.model.p2_card_action_trigger import (
+    CallBackCard,
+    CallBackToast,
+    P2CardActionTrigger,
+    P2CardActionTriggerResponse,
+)
 
 from feishu_codex_bot.config import AppConfig
 from feishu_codex_bot.logging import ContextLoggerAdapter, get_logger
 from feishu_codex_bot.models.inbound import (
     BotAddedEvent,
+    CardActionCallback,
+    CardActionCallbackResult,
     FileContent,
     ImageContent,
     InboundContentPart,
@@ -45,8 +64,16 @@ class FeishuApiError(RuntimeError):
     """Raised when a Feishu OpenAPI call fails."""
 
 
+@dataclass(frozen=True, slots=True)
+class FeishuReplyCardRef:
+    message_id: str
+    card_id: str
+
+
 class FeishuAdapter:
     """Wrap the official Feishu SDK behind project-specific interfaces."""
+
+    _STREAMING_CARD_CONTENT_ELEMENT_ID = "content"
 
     def __init__(
         self,
@@ -73,6 +100,7 @@ class FeishuAdapter:
         *,
         on_message: Callable[[InboundMessage], None],
         on_bot_added: Callable[[BotAddedEvent], None] | None = None,
+        on_card_action: Callable[[CardActionCallback], CardActionCallbackResult] | None = None,
     ) -> lark.ws.Client:
         builder = lark.EventDispatcherHandler.builder(
             "",
@@ -84,6 +112,9 @@ class FeishuAdapter:
         )
         builder.register_p2_im_chat_member_bot_added_v1(
             lambda event: self._dispatch_bot_added(event, on_bot_added)
+        )
+        builder.register_p2_card_action_trigger(
+            lambda event: self._dispatch_card_action(event, on_card_action)
         )
         return lark.ws.Client(
             self._config.feishu.app_id,
@@ -97,6 +128,7 @@ class FeishuAdapter:
         *,
         on_message: Callable[[InboundMessage], None],
         on_bot_added: Callable[[BotAddedEvent], None] | None = None,
+        on_card_action: Callable[[CardActionCallback], CardActionCallbackResult] | None = None,
     ) -> None:
         self._logger.bind(event="feishu.long_connection.start").info(
             "Starting Feishu long connection"
@@ -104,6 +136,7 @@ class FeishuAdapter:
         self.create_long_connection_client(
             on_message=on_message,
             on_bot_added=on_bot_added,
+            on_card_action=on_card_action,
         ).start()
 
     def normalize_message_event(self, event: P2ImMessageReceiveV1) -> InboundMessage:
@@ -234,6 +267,34 @@ class FeishuAdapter:
             reply_in_thread=reply_in_thread,
         )
 
+    def reply_streaming_card(
+        self,
+        *,
+        message_id: str,
+        text: str,
+        reply_in_thread: bool = False,
+        status: str = "streaming",
+    ) -> FeishuReplyCardRef:
+        card_id = self.create_streaming_card(
+            text=text,
+            status=status,
+        )
+        self.enable_streaming_card(card_id=card_id, sequence=1)
+        reply_message_id = self._reply_message(
+            message_id=message_id,
+            msg_type="interactive",
+            content=self._json_content(
+                {
+                    "type": "card",
+                    "data": {
+                        "card_id": card_id,
+                    },
+                }
+            ),
+            reply_in_thread=reply_in_thread,
+        )
+        return FeishuReplyCardRef(message_id=reply_message_id, card_id=card_id)
+
     def reply_image(
         self,
         *,
@@ -284,6 +345,97 @@ class FeishuAdapter:
         ).info("Feishu message updated")
         return updated_message_id
 
+    def create_streaming_card(self, *, text: str, status: str) -> str:
+        payload = self._build_streaming_card_payload(
+            text=text,
+            status=status,
+        )
+        request_type = "card_json"
+        request_data = self._json_content(payload)
+        self._logger.bind(
+            event="feishu.card.create.request",
+            request_type=request_type,
+            request_data=request_data,
+        ).info("Creating Feishu streaming card")
+        response = self._client.cardkit.v1.card.create(
+            CreateCardRequest.builder()
+            .request_body(
+                CreateCardRequestBody.builder()
+                .type(request_type)
+                .data(request_data)
+                .build()
+            )
+            .build()
+        )
+        self._ensure_success(response, action="create_streaming_card", key=status)
+        card_id = getattr(response.data, "card_id", None)
+        if not card_id:
+            raise FeishuApiError("Feishu create_streaming_card succeeded but card_id is missing")
+        self._logger.bind(
+            event="feishu.card.created",
+            card_id=card_id,
+            status=status,
+            text_length=len(text),
+        ).info("Created Feishu streaming card")
+        return card_id
+
+    def enable_streaming_card(self, *, card_id: str, sequence: int) -> None:
+        response = self._client.cardkit.v1.card.settings(
+            SettingsCardRequest.builder()
+            .card_id(card_id)
+            .request_body(
+                SettingsCardRequestBody.builder()
+                .settings(self._json_content({"config": {"streaming_mode": True}}))
+                .uuid(uuid.uuid4().hex)
+                .sequence(sequence)
+                .build()
+            )
+            .build()
+        )
+        self._ensure_success(response, action="enable_streaming_card", key=card_id)
+        self._logger.bind(
+            event="feishu.card.streaming_enabled",
+            card_id=card_id,
+            sequence=sequence,
+        ).info("Enabled Feishu card streaming mode")
+
+    def update_streaming_card(
+        self,
+        *,
+        card_id: str,
+        text: str,
+        status: str,
+        sequence: int,
+    ) -> None:
+        self._logger.bind(
+            event="feishu.card.content.request",
+            card_id=card_id,
+            element_id=self._STREAMING_CARD_CONTENT_ELEMENT_ID,
+            request_content=self._build_streaming_card_content(text=text, status=status),
+            sequence=sequence,
+        ).info("Updating Feishu streaming card content")
+        response = self._client.cardkit.v1.card_element.content(
+            ContentCardElementRequest.builder()
+            .card_id(card_id)
+            .element_id(self._STREAMING_CARD_CONTENT_ELEMENT_ID)
+            .request_body(
+                ContentCardElementRequestBody.builder()
+                .content(self._build_streaming_card_content(text=text, status=status))
+                .uuid(uuid.uuid4().hex)
+                .sequence(sequence)
+                .build()
+            )
+            .build()
+        )
+        self._ensure_success(response, action="update_streaming_card", key=card_id)
+        self._logger.bind(
+            event="feishu.card.content.updated",
+            card_id=card_id,
+            status=status,
+            sequence=sequence,
+            text_length=len(text),
+        ).info("Updated Feishu streaming card content")
+
     def add_reaction(self, *, message_id: str, emoji_type: str) -> str:
         response = self._client.im.v1.message_reaction.create(
             CreateMessageReactionRequest.builder()
@@ -332,20 +484,37 @@ class FeishuAdapter:
         self,
         *,
         message_id: str,
-        text: str,
+        card_payload: dict[str, object],
         reply_in_thread: bool = False,
     ) -> str:
-        return self.reply_text(
+        return self._reply_message(
             message_id=message_id,
-            text=text,
+            msg_type="interactive",
+            content=self._json_content(card_payload),
             reply_in_thread=reply_in_thread,
         )
 
-    def update_approval_message(self, *, message_id: str, text: str) -> str:
-        return self.update_text(
-            message_id=message_id,
-            text=text,
+    def update_approval_message(self, *, message_id: str, card_payload: dict[str, object]) -> str:
+        response = self._client.im.v1.message.update(
+            UpdateMessageRequest.builder()
+            .message_id(message_id)
+            .request_body(
+                UpdateMessageRequestBody.builder()
+                .msg_type("interactive")
+                .content(self._json_content(card_payload))
+                .build()
+            )
+            .build()
         )
+        self._ensure_success(response, action="update_message", key=message_id)
+        updated_message_id = getattr(response.data, "message_id", None)
+        if not updated_message_id:
+            raise FeishuApiError("Feishu update_message succeeded but message_id is missing")
+        self._logger.bind(
+            event="feishu.message.updated",
+            feishu_message_id=updated_message_id,
+        ).info("Feishu message updated")
+        return updated_message_id
 
     def send_user_input_message(
         self,
@@ -381,6 +550,27 @@ class FeishuAdapter:
             return
         handler(normalized)
 
+    def _dispatch_card_action(
+        self,
+        event: P2CardActionTrigger,
+        handler: Callable[[CardActionCallback], CardActionCallbackResult] | None,
+    ) -> P2CardActionTriggerResponse:
+        normalized = self.normalize_card_action_event(event)
+        if handler is None:
+            self._logger.bind(
+                event="feishu.card_action.unhandled",
+                feishu_event_id=normalized.event_id,
+                open_message_id=normalized.open_message_id,
+                operator_open_id=normalized.operator_open_id,
+            ).warning("Card action callback received without handler")
+            return self._build_card_action_response(
+                CardActionCallbackResult(
+                    toast_type="warning",
+                    toast_text="暂不支持此卡片交互。",
+                )
+            )
+        return self._build_card_action_response(handler(normalized))
+
     def _send_message(
         self,
         *,
@@ -414,6 +604,60 @@ class FeishuAdapter:
             msg_type=msg_type,
         ).info("Feishu message sent")
         return message_id
+
+    def normalize_card_action_event(self, event: P2CardActionTrigger) -> CardActionCallback:
+        header = getattr(event, "header", None)
+        operator = getattr(getattr(event, "event", None), "operator", None)
+        action = getattr(getattr(event, "event", None), "action", None)
+        context = getattr(getattr(event, "event", None), "context", None)
+        normalized = CardActionCallback(
+            event_id=getattr(header, "event_id", None),
+            event_type=getattr(header, "event_type", None),
+            tenant_key=getattr(header, "tenant_key", None),
+            app_id=getattr(header, "app_id", None),
+            operator_open_id=getattr(operator, "open_id", None),
+            operator_user_id=getattr(operator, "user_id", None),
+            operator_union_id=getattr(operator, "union_id", None),
+            open_message_id=getattr(context, "open_message_id", None),
+            open_chat_id=getattr(context, "open_chat_id", None),
+            action_tag=getattr(action, "tag", None),
+            action_name=getattr(action, "name", None),
+            action_value=self._string_mapping(getattr(action, "value", None)),
+            form_value=self._string_mapping(getattr(action, "form_value", None)),
+            input_value=self._string_or_none(getattr(action, "input_value", None)),
+            occurred_at=InboundMessage.utc_from_millis(getattr(header, "create_time", None)),
+        )
+        self._logger.bind(
+            event="feishu.card_action.normalized",
+            feishu_event_id=normalized.event_id,
+            open_message_id=normalized.open_message_id,
+            open_chat_id=normalized.open_chat_id,
+            operator_open_id=normalized.operator_open_id,
+            action_tag=normalized.action_tag,
+            action_name=normalized.action_name,
+            action_value=normalized.action_value,
+        ).info("Feishu card action normalized")
+        return normalized
+
+    def _build_card_action_response(
+        self,
+        result: CardActionCallbackResult,
+    ) -> P2CardActionTriggerResponse:
+        response = P2CardActionTriggerResponse()
+        response.toast = CallBackToast(
+            {
+                "type": result.toast_type,
+                "content": result.toast_text,
+            }
+        )
+        if result.card_payload is not None:
+            response.card = CallBackCard(
+                {
+                    "type": "card_json",
+                    "data": result.card_payload,
+                }
+            )
+        return response
 
     def _reply_message(
         self,
@@ -643,6 +887,41 @@ class FeishuAdapter:
     def _json_content(self, payload: dict[str, object]) -> str:
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
+    def _build_streaming_card_payload(self, *, text: str, status: str) -> dict[str, object]:
+        return {
+            "schema": "2.0",
+            "config": {
+                "wide_screen_mode": True,
+            },
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": "Codex",
+                },
+                "template": "blue",
+            },
+            "body": {
+                "direction": "vertical",
+                "padding": "12px 12px 12px 12px",
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "element_id": self._STREAMING_CARD_CONTENT_ELEMENT_ID,
+                        "content": self._build_streaming_card_content(text=text, status=status),
+                    },
+                ],
+            },
+        }
+
+    def _build_streaming_card_content(self, *, text: str, status: str) -> str:
+        status_text = {
+            "streaming": "正在思考中",
+            "completed": "已完成",
+            "failed": "回复已中断",
+        }.get(status, "处理中")
+        normalized_text = text.strip() if text.strip() else " "
+        return f"> {status_text}\n\n{normalized_text}"
+
     def _require_value(self, value: str | None, field_name: str) -> str:
         if value:
             return value
@@ -662,3 +941,13 @@ class FeishuAdapter:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    def _string_mapping(self, value: object) -> dict[str, str]:
+        if not isinstance(value, dict):
+            return {}
+        normalized: dict[str, str] = {}
+        for key, item in value.items():
+            if key is None or item is None:
+                continue
+            normalized[str(key)] = str(item)
+        return normalized
