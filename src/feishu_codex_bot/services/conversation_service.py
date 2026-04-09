@@ -23,7 +23,6 @@ from feishu_codex_bot.models.inbound import (
     ImageContent,
     InboundContentPart,
     InboundMessage,
-    MentionRef,
     TextContent,
 )
 from feishu_codex_bot.models.session import (
@@ -41,7 +40,7 @@ from feishu_codex_bot.workers.session_executor import SessionExecutor
 
 
 _DM_SESSION_TTL = timedelta(hours=1)
-_LEADING_MENTION_PATTERN = re.compile(r"^@\S+")
+_MENTION_PLACEHOLDER_PATTERN = re.compile(r"@_user_\d+")
 
 
 class ConversationService:
@@ -529,17 +528,14 @@ class ConversationService:
             return message.parts
 
         normalized: list[InboundContentPart] = []
-        strip_leading_mentions = True
         for part in message.parts:
-            if strip_leading_mentions and isinstance(part, TextContent):
-                stripped = self._strip_leading_mentions(part.text, message.mentions)
-                if stripped:
-                    normalized.append(TextContent(stripped))
-                    strip_leading_mentions = False
+            if isinstance(part, TextContent):
+                cleaned = self._strip_group_mention_placeholders(part.text)
+                if cleaned:
+                    normalized.append(TextContent(cleaned))
                 continue
 
             normalized.append(part)
-            strip_leading_mentions = False
         return tuple(normalized)
 
     def _extract_slash_command(self, text: str) -> str | None:
@@ -549,45 +545,13 @@ class ConversationService:
         command = candidate.split(None, 1)[0].lower()
         return command
 
-    def _strip_leading_mentions(
-        self,
-        text: str,
-        mentions: tuple[MentionRef, ...],
-    ) -> str:
-        remaining = text.lstrip()
-        if not remaining:
+    def _strip_group_mention_placeholders(self, text: str) -> str:
+        if not text:
             return ""
-
-        mention_tokens = [
-            f"@{name.strip()}"
-            for name in (mention.name for mention in mentions if mention.name)
-            if name.strip()
-        ]
-        mention_tokens.sort(key=len, reverse=True)
-
-        changed = False
-        while remaining.startswith("@"):
-            matched = False
-            for token in mention_tokens:
-                if not remaining.startswith(token):
-                    continue
-                suffix = remaining[len(token) : len(token) + 1]
-                if suffix and not suffix.isspace():
-                    continue
-                remaining = remaining[len(token) :].lstrip()
-                matched = True
-                changed = True
-                break
-            if matched:
-                continue
-
-            generic_match = _LEADING_MENTION_PATTERN.match(remaining)
-            if generic_match is None:
-                break
-            remaining = remaining[generic_match.end() :].lstrip()
-            changed = True
-
-        return remaining if changed else text
+        cleaned = _MENTION_PLACEHOLDER_PATTERN.sub("", text)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"[ \t]*\n[ \t]*", "\n", cleaned)
+        return cleaned.strip()
 
     def _is_group_addressed(self, message: InboundMessage) -> bool:
         return bool(message.mentions)

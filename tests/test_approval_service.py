@@ -161,7 +161,7 @@ def test_handle_server_request_sends_approval_card(tmp_path: Path) -> None:
     elements = payload["body"]["elements"]
     assert all(element["tag"] != "action" for element in elements)
     assert elements[0]["tag"] == "markdown"
-    assert elements[0]["content"] == "**命令**: pytest\n**cwd**: /workspace"
+    assert elements[0]["content"] == "**命令**: `pytest`\n**cwd**: `/workspace`"
     assert elements[1]["tag"] == "button"
     assert [element["text"]["content"] for element in elements[1:]] == [
         "同意",

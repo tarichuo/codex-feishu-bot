@@ -23,10 +23,12 @@ from feishu_codex_bot.persistence.session_repo import SessionRecord
 
 _codex_client_stub = types.ModuleType("feishu_codex_bot.adapters.codex_client")
 _codex_client_stub.CodexClient = object
+_codex_client_stub.DEFER_SERVER_REQUEST = object()
 sys.modules.setdefault("feishu_codex_bot.adapters.codex_client", _codex_client_stub)
 
 _feishu_adapter_stub = types.ModuleType("feishu_codex_bot.adapters.feishu_adapter")
 _feishu_adapter_stub.FeishuAdapter = object
+_feishu_adapter_stub.FeishuReplyCardRef = object
 sys.modules.setdefault("feishu_codex_bot.adapters.feishu_adapter", _feishu_adapter_stub)
 
 _media_service_stub = types.ModuleType("feishu_codex_bot.services.media_service")
@@ -395,7 +397,7 @@ def test_dm_rotates_thread_after_one_hour(tmp_path: Path) -> None:
 def test_group_thread_persists_without_expiration(tmp_path: Path) -> None:
     service, codex_client, _, session_repository, _, _ = _build_service(tmp_path)
     now = datetime.now(tz=timezone.utc)
-    mentions = (MentionRef(key=None, name="bot", open_id="ou_bot", user_id=None, union_id=None),)
+    mentions = (MentionRef(key="@_user_1", name="bot", open_id="ou_bot", user_id=None, union_id=None),)
     scope_key = "cli_test_app:chat-group"
     session_repository.upsert_session(
         scope_type="group",
@@ -413,7 +415,7 @@ def test_group_thread_persists_without_expiration(tmp_path: Path) -> None:
         service.handle_message(
             _build_message(
                 message_id="msg-3",
-                text="@bot 继续讨论",
+                text="@_user_1 继续讨论",
                 created_at=now,
                 chat_type="group",
                 chat_id="chat-group",
@@ -425,6 +427,7 @@ def test_group_thread_persists_without_expiration(tmp_path: Path) -> None:
     assert result.status == "submitted"
     assert result.thread_id == "thread-group"
     assert codex_client.resume_calls == ["thread-group"]
+    assert codex_client.start_turn_calls[0].input_items[0].text == "继续讨论"
 
 
 def test_clear_rotates_thread(tmp_path: Path) -> None:
@@ -460,6 +463,79 @@ def test_clear_rotates_thread(tmp_path: Path) -> None:
     assert result.thread_id == "thread-1"
     assert result.thread_generation == 3
     assert codex_client.resume_calls == []
+
+
+def test_group_message_strips_all_mention_placeholders_before_dispatch(tmp_path: Path) -> None:
+    service, codex_client, _, session_repository, _, _ = _build_service(tmp_path)
+    now = datetime.now(tz=timezone.utc)
+    mentions = (
+        MentionRef(key="@_user_1", name="bot", open_id="ou_bot", user_id=None, union_id=None),
+        MentionRef(key="@_user_2", name="user", open_id="ou_user", user_id=None, union_id=None),
+    )
+    scope_key = "cli_test_app:chat-group"
+    session_repository.upsert_session(
+        scope_type="group",
+        scope_key=scope_key,
+        bot_app_id="cli_test_app",
+        thread_id="thread-group",
+        user_open_id=None,
+        chat_id="chat-group",
+        thread_generation=1,
+        last_message_at=(now - timedelta(minutes=5)).isoformat(),
+        expires_at=None,
+    )
+
+    result = asyncio.run(
+        service.handle_message(
+            _build_message(
+                message_id="msg-group-clean",
+                text=" @_user_1   你好  @_user_2  世界 ",
+                created_at=now,
+                chat_type="group",
+                chat_id="chat-group",
+                mentions=mentions,
+            )
+        )
+    )
+
+    assert result.status == "submitted"
+    assert codex_client.start_turn_calls[0].input_items[0].text == "你好 世界"
+
+
+def test_group_slash_command_is_detected_after_placeholder_cleanup(tmp_path: Path) -> None:
+    service, codex_client, _, session_repository, _, _ = _build_service(tmp_path)
+    now = datetime.now(tz=timezone.utc)
+    mentions = (MentionRef(key="@_user_1", name="bot", open_id="ou_bot", user_id=None, union_id=None),)
+    scope_key = "cli_test_app:chat-group"
+    session_repository.upsert_session(
+        scope_type="group",
+        scope_key=scope_key,
+        bot_app_id="cli_test_app",
+        thread_id="thread-group",
+        user_open_id=None,
+        chat_id="chat-group",
+        thread_generation=2,
+        last_message_at=now.isoformat(),
+        expires_at=None,
+    )
+
+    result = asyncio.run(
+        service.handle_message(
+            _build_message(
+                message_id="msg-group-slash",
+                text="@_user_1   /clear",
+                created_at=now,
+                chat_type="group",
+                chat_id="chat-group",
+                mentions=mentions,
+            )
+        )
+    )
+
+    assert result.status == "submitted"
+    assert result.is_slash_command is True
+    assert result.slash_command == "/clear"
+    assert codex_client.start_turn_calls[0].input_items[0].text == "/clear"
 
 
 def test_unsupported_slash_command_is_rejected(tmp_path: Path) -> None:

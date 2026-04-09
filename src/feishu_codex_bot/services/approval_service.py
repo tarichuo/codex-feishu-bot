@@ -306,16 +306,16 @@ class ApprovalService:
     def _build_command_approval_prompt(self, request: CodexServerRequest) -> str:
         params = request.params
         lines = [
-            f"**命令**: {params.get('command') or '-'}",
-            f"**cwd**: {params.get('cwd') or '-'}",
+            f"**命令**: `{params.get('command') or '-'}`",
+            f"**cwd**: `{params.get('cwd') or '-'}`",
         ]
         return "\n".join(lines)
 
     def _build_file_approval_prompt(self, request: CodexServerRequest) -> str:
         params = request.params
         lines = [
-            f"**授权目录**: {params.get('grantRoot') or '-'}",
-            f"**原因**: {params.get('reason') or '-'}",
+            f"**授权目录**: `{params.get('grantRoot') or '-'}`",
+            f"**原因**: `{params.get('reason') or '-'}`",
         ]
         return "\n".join(lines)
 
@@ -778,15 +778,15 @@ class ApprovalService:
         if method == "item/commandExecution/requestApproval":
             return "\n".join(
                 (
-                    f"**命令**: {params.get('command') or '-'}",
-                    f"**cwd**: {params.get('cwd') or '-'}",
+                    f"**命令**: `{params.get('command') or '-'}`",
+                    f"**cwd**: `{params.get('cwd') or '-'}`",
                 )
             )
         if method == "item/fileChange/requestApproval":
             return "\n".join(
                 (
-                    f"**授权目录**: {params.get('grantRoot') or '-'}",
-                    f"**原因**: {params.get('reason') or '-'}",
+                    f"**授权目录**: `{params.get('grantRoot') or '-'}`",
+                    f"**原因**: `{params.get('reason') or '-'}`",
                 )
             )
         if method == "item/permissions/requestApproval":
@@ -818,8 +818,8 @@ class ApprovalService:
             elif enabled is False:
                 network_summary = "disabled"
         return [
-            f"**文件权限**: {'; '.join(file_segments) if file_segments else '-'}",
-            f"**网络权限**: {network_summary}",
+            f"**文件权限**: `{'; '.join(file_segments) if file_segments else '-'}`",
+            f"**网络权限**: `{network_summary}`",
         ]
 
     def _build_resolved_approval_buttons(self, record: PendingActionRecord) -> list[dict[str, object]]:
