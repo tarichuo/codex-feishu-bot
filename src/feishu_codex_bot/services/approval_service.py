@@ -42,6 +42,7 @@ class ApprovalRequestContext:
 
     session_scope_key: str | None
     source_message_id: str
+    chat_id: str
     is_group_chat: bool = False
     reply_in_thread: bool = False
 
@@ -90,6 +91,7 @@ class ApprovalService:
         prompt_card = self._build_pending_approval_card(request=request, prompt_text=prompt_text)
         prompt_message_id = self._send_prompt_message(
             request=request,
+            chat_id=context.chat_id,
             source_message_id=context.source_message_id,
             text=prompt_text,
             card_payload=prompt_card,
@@ -332,6 +334,7 @@ class ApprovalService:
         self,
         *,
         request: CodexServerRequest,
+        chat_id: str,
         source_message_id: str,
         text: str,
         card_payload: dict[str, object] | None,
@@ -339,9 +342,8 @@ class ApprovalService:
     ) -> str:
         if request.method in _APPROVAL_METHODS:
             return self._feishu_adapter.send_approval_message(
-                message_id=source_message_id,
+                receive_id=chat_id,
                 card_payload=card_payload or self._build_fallback_info_card("审批请求", text),
-                reply_in_thread=reply_in_thread,
             )
         return self._feishu_adapter.send_user_input_message(
             message_id=source_message_id,

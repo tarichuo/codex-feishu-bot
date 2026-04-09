@@ -483,15 +483,14 @@ class FeishuAdapter:
     def send_approval_message(
         self,
         *,
-        message_id: str,
+        receive_id: str,
         card_payload: dict[str, object],
-        reply_in_thread: bool = False,
     ) -> str:
-        return self._reply_message(
-            message_id=message_id,
+        return self._send_message(
+            receive_id=receive_id,
+            receive_id_type="chat_id",
             msg_type="interactive",
             content=self._json_content(card_payload),
-            reply_in_thread=reply_in_thread,
         )
 
     def update_approval_message(self, *, message_id: str, card_payload: dict[str, object]) -> str:
@@ -995,13 +994,6 @@ class FeishuAdapter:
             "schema": "2.0",
             "config": {
                 "wide_screen_mode": True,
-            },
-            "header": {
-                "title": {
-                    "tag": "plain_text",
-                    "content": "Codex",
-                },
-                "template": "blue",
             },
             "body": {
                 "direction": "vertical",

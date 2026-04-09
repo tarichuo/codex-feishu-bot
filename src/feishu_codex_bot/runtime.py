@@ -39,6 +39,7 @@ _CONTROL_HELP_MESSAGE = (
 class _TurnRuntimeContext:
     session_scope_key: str
     source_message_id: str
+    chat_id: str
     thread_id: str
     is_group_chat: bool
     reply_in_thread: bool
@@ -221,6 +222,7 @@ class ApplicationRuntime:
         self._turn_contexts[dispatch_result.turn_id] = _TurnRuntimeContext(
             session_scope_key=dispatch_result.session_scope_key,
             source_message_id=message.message_id,
+            chat_id=message.chat_id,
             thread_id=dispatch_result.thread_id,
             is_group_chat=message.is_group_message,
             reply_in_thread=False,
@@ -360,6 +362,7 @@ class ApplicationRuntime:
                 context=ApprovalRequestContext(
                     session_scope_key=turn_context.session_scope_key,
                     source_message_id=turn_context.source_message_id,
+                    chat_id=turn_context.chat_id,
                     is_group_chat=turn_context.is_group_chat,
                     reply_in_thread=turn_context.reply_in_thread,
                 ),

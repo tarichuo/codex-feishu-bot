@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+import sys
+import types
 
 from feishu_codex_bot.config import (
     AppConfig,
@@ -14,6 +16,16 @@ from feishu_codex_bot.config import (
 from feishu_codex_bot.models.actions import CodexServerRequest
 from feishu_codex_bot.persistence.action_repo import PendingActionRepository
 from feishu_codex_bot.persistence.db import DatabaseManager
+
+_codex_client_stub = types.ModuleType("feishu_codex_bot.adapters.codex_client")
+_codex_client_stub.DEFER_SERVER_REQUEST = object()
+_codex_client_stub.CodexClient = object
+sys.modules.setdefault("feishu_codex_bot.adapters.codex_client", _codex_client_stub)
+
+_feishu_adapter_stub = types.ModuleType("feishu_codex_bot.adapters.feishu_adapter")
+_feishu_adapter_stub.FeishuAdapter = object
+sys.modules.setdefault("feishu_codex_bot.adapters.feishu_adapter", _feishu_adapter_stub)
+
 from feishu_codex_bot.services.approval_service import ApprovalRequestContext, ApprovalService
 
 
@@ -37,15 +49,13 @@ class _FakeFeishuAdapter:
     def send_approval_message(
         self,
         *,
-        message_id: str,
+        receive_id: str,
         card_payload: dict[str, object],
-        reply_in_thread: bool = False,
     ) -> str:
         self.sent_cards.append(
             {
-                "message_id": message_id,
+                "receive_id": receive_id,
                 "card_payload": card_payload,
-                "reply_in_thread": reply_in_thread,
             }
         )
         return "approval-message-1"
@@ -129,6 +139,7 @@ def test_handle_server_request_sends_approval_card(tmp_path: Path) -> None:
             context=ApprovalRequestContext(
                 session_scope_key="scope-1",
                 source_message_id="om-source-1",
+                chat_id="oc_chat_1",
             ),
         )
 
@@ -136,7 +147,7 @@ def test_handle_server_request_sends_approval_card(tmp_path: Path) -> None:
 
     assert len(feishu_adapter.sent_cards) == 1
     sent = feishu_adapter.sent_cards[0]
-    assert sent["message_id"] == "om-source-1"
+    assert sent["receive_id"] == "oc_chat_1"
     payload = sent["card_payload"]
     assert payload["header"]["title"]["content"] == "Codex 请求命令审批"
     elements = payload["body"]["elements"]
@@ -173,6 +184,7 @@ def test_submit_approval_response_updates_card_summary(tmp_path: Path) -> None:
             context=ApprovalRequestContext(
                 session_scope_key="scope-2",
                 source_message_id="om-source-2",
+                chat_id="oc_chat_2",
             ),
         )
         await service.submit_approval_response(
