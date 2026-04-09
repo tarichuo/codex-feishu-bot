@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import time
 from typing import Any, Mapping, Sequence
 
 from feishu_codex_bot.adapters.codex_client import (
@@ -34,6 +35,10 @@ _USER_INPUT_METHODS = {
     "item/tool/requestUserInput",
     "mcpServer/elicitation/request",
 }
+
+
+def _elapsed_ms(start_time: float) -> int:
+    return int((time.perf_counter() - start_time) * 1000)
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,25 +141,64 @@ class ApprovalService:
         *,
         scope: str = "turn",
         granted_permissions: Mapping[str, Any] | None = None,
+        update_prompt: bool = True,
     ) -> PendingActionRecord:
+        total_start = time.perf_counter()
         record = self._require_record(request_id)
+        payload_start = time.perf_counter()
         response_payload = self._build_approval_response_payload(
             record=record,
             decision=decision,
             scope=scope,
             granted_permissions=granted_permissions,
         )
+        self._logger.bind(
+            event="approval.response.payload_built",
+            request_id=record.request_id,
+            decision=decision,
+            scope=scope,
+            elapsed_ms=_elapsed_ms(payload_start),
+            total_elapsed_ms=_elapsed_ms(total_start),
+        ).info("Built approval response payload")
+        codex_start = time.perf_counter()
         await self._codex_client.respond_to_server_request(
             record.original_request_id,
             response_payload,
         )
+        self._logger.bind(
+            event="approval.response.codex_submitted",
+            request_id=record.request_id,
+            elapsed_ms=_elapsed_ms(codex_start),
+            total_elapsed_ms=_elapsed_ms(total_start),
+        ).info("Submitted approval response to Codex")
+        persist_start = time.perf_counter()
         updated = self._persist_response(
             record=record,
             response_payload=response_payload,
             status=self._status_from_approval_response(record, response_payload),
         )
-        self._update_prompt_after_response(updated)
+        self._logger.bind(
+            event="approval.response.persist_phase_completed",
+            request_id=updated.request_id,
+            status=updated.status,
+            elapsed_ms=_elapsed_ms(persist_start),
+            total_elapsed_ms=_elapsed_ms(total_start),
+        ).info("Persisted approval response state")
+        prompt_update_start = time.perf_counter()
+        if update_prompt:
+            self._update_prompt_after_response(updated)
+        self._logger.bind(
+            event="approval.response.completed",
+            request_id=updated.request_id,
+            status=updated.status,
+            prompt_updated=update_prompt,
+            prompt_update_elapsed_ms=_elapsed_ms(prompt_update_start),
+            total_elapsed_ms=_elapsed_ms(total_start),
+        ).info("Completed approval response handling")
         return updated
+
+    def finalize_response_side_effects(self, record: PendingActionRecord) -> None:
+        self._update_prompt_after_response(record)
 
     async def submit_user_input_response(
         self,
@@ -164,23 +208,55 @@ class ApprovalService:
         action: str = "accept",
         content: object | None = None,
     ) -> PendingActionRecord:
+        total_start = time.perf_counter()
         record = self._require_record(request_id)
+        payload_start = time.perf_counter()
         response_payload = self._build_user_input_response_payload(
             record=record,
             answers=answers,
             action=action,
             content=content,
         )
+        self._logger.bind(
+            event="user_input.response.payload_built",
+            request_id=record.request_id,
+            action=action,
+            elapsed_ms=_elapsed_ms(payload_start),
+            total_elapsed_ms=_elapsed_ms(total_start),
+        ).info("Built user input response payload")
+        codex_start = time.perf_counter()
         await self._codex_client.respond_to_server_request(
             record.original_request_id,
             response_payload,
         )
+        self._logger.bind(
+            event="user_input.response.codex_submitted",
+            request_id=record.request_id,
+            elapsed_ms=_elapsed_ms(codex_start),
+            total_elapsed_ms=_elapsed_ms(total_start),
+        ).info("Submitted user input response to Codex")
+        persist_start = time.perf_counter()
         updated = self._persist_response(
             record=record,
             response_payload=response_payload,
             status=self._status_from_user_input_response(record, response_payload),
         )
+        self._logger.bind(
+            event="user_input.response.persist_phase_completed",
+            request_id=updated.request_id,
+            status=updated.status,
+            elapsed_ms=_elapsed_ms(persist_start),
+            total_elapsed_ms=_elapsed_ms(total_start),
+        ).info("Persisted user input response state")
+        prompt_update_start = time.perf_counter()
         self._update_prompt_after_response(updated)
+        self._logger.bind(
+            event="user_input.response.completed",
+            request_id=updated.request_id,
+            status=updated.status,
+            prompt_update_elapsed_ms=_elapsed_ms(prompt_update_start),
+            total_elapsed_ms=_elapsed_ms(total_start),
+        ).info("Completed user input response handling")
         return updated
 
     def get_pending_action(self, request_id: str | int) -> PendingActionRecord | None:
@@ -438,6 +514,7 @@ class ApprovalService:
     def _update_prompt_after_response(self, record: PendingActionRecord) -> None:
         if not record.feishu_message_id:
             return
+        start_time = time.perf_counter()
         response = record.payload.get("response")
         method = record.payload.get("method")
         try:
@@ -451,6 +528,7 @@ class ApprovalService:
                     request_id=record.request_id,
                     status=record.status,
                     feishu_message_id=record.feishu_message_id,
+                    elapsed_ms=_elapsed_ms(start_time),
                 ).info("Updated Feishu approval prompt after response")
                 return
             summary = "\n".join(
@@ -465,12 +543,20 @@ class ApprovalService:
                 message_id=record.feishu_message_id,
                 text=summary,
             )
+            self._logger.bind(
+                event="user_input.prompt_updated",
+                request_id=record.request_id,
+                status=record.status,
+                feishu_message_id=record.feishu_message_id,
+                elapsed_ms=_elapsed_ms(start_time),
+            ).info("Updated Feishu user-input prompt after response")
         except Exception:
             self._logger.bind(
                 event="approval.prompt_update_failed",
                 request_id=record.request_id,
                 status=record.status,
                 feishu_message_id=record.feishu_message_id,
+                elapsed_ms=_elapsed_ms(start_time),
             ).exception("Failed to update Feishu prompt after approval response")
 
     def _status_from_approval_response(

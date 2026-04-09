@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import json
 import shlex
 import threading
+import time
 
 from feishu_codex_bot.adapters.codex_client import CodexConnectionClosedError
 from feishu_codex_bot.bootstrap import RuntimeContext, bootstrap_runtime
@@ -33,6 +34,10 @@ _CONTROL_HELP_MESSAGE = (
     "/input <request_id> <question_id>=<value> ...\n"
     "/input <request_id> --action <accept|decline|cancel> [--content <json_or_text>]"
 )
+
+
+def _elapsed_ms(start_time: float) -> int:
+    return int((time.perf_counter() - start_time) * 1000)
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +148,7 @@ class ApplicationRuntime:
         self,
         action: CardActionCallback,
     ) -> CardActionCallbackResult:
+        start_time = time.perf_counter()
         if self._loop is None:
             return CardActionCallbackResult(
                 toast_type="error",
@@ -153,12 +159,21 @@ class ApplicationRuntime:
             self._loop,
         )
         try:
-            return future.result(timeout=2.8)
+            result = future.result(timeout=2.8)
+            self._logger.bind(
+                event="runtime.card_action.callback_completed",
+                request_id=action.action_value.get("request_id"),
+                operator_open_id=action.operator_open_id,
+                elapsed_ms=_elapsed_ms(start_time),
+                toast_type=result.toast_type,
+            ).info("Card action callback completed within timeout")
+            return result
         except FutureTimeoutError:
             self._logger.bind(
                 event="runtime.card_action.timeout",
                 request_id=action.action_value.get("request_id"),
                 operator_open_id=action.operator_open_id,
+                elapsed_ms=_elapsed_ms(start_time),
             ).warning("Card action handling timed out")
             return CardActionCallbackResult(
                 toast_type="warning",
@@ -169,6 +184,7 @@ class ApplicationRuntime:
                 event="runtime.card_action.failed",
                 request_id=action.action_value.get("request_id"),
                 operator_open_id=action.operator_open_id,
+                elapsed_ms=_elapsed_ms(start_time),
             ).exception("Failed to handle Feishu card action")
             return CardActionCallbackResult(
                 toast_type="error",
@@ -252,6 +268,7 @@ class ApplicationRuntime:
         self,
         action: CardActionCallback,
     ) -> CardActionCallbackResult:
+        total_start = time.perf_counter()
         action_value = action.action_value
         self._logger.bind(
             event="runtime.card_action.received",
@@ -309,25 +326,108 @@ class ApplicationRuntime:
                 toast_text=f"审批请求 {request_id} 已处理。",
             )
 
+        self._logger.bind(
+            event="runtime.card_action.validated",
+            request_id=request_id,
+            operator_open_id=action.operator_open_id,
+            elapsed_ms=_elapsed_ms(total_start),
+        ).info("Validated card action request")
+
         decision = action_value.get("decision") or "decline"
         scope = action_value.get("scope") or "turn"
+        approval_start = time.perf_counter()
         updated = await self._context.approval_service.submit_approval_response(
             request_id,
             decision,
             scope=scope,
+            update_prompt=False,
         )
-        if updated.turn_id:
-            started_followup = await self._context.reply_service.start_followup_turn(updated.turn_id)
-            self._logger.bind(
-                event="runtime.card_action.followup_reply_started",
-                request_id=updated.request_id,
-                turn_id=updated.turn_id,
-                started=started_followup,
-            ).info("Prepared follow-up reply stream after approval")
+        self._logger.bind(
+            event="runtime.card_action.approval_response_submitted",
+            request_id=updated.request_id,
+            status=updated.status,
+            elapsed_ms=_elapsed_ms(approval_start),
+            total_elapsed_ms=_elapsed_ms(total_start),
+        ).info("Submitted approval response")
+        self._schedule_coroutine(
+            self._finalize_card_action_async(updated),
+            description=f"card_action_finalize:{updated.request_id}",
+        )
+        self._logger.bind(
+            event="runtime.card_action.finalize_scheduled",
+            request_id=updated.request_id,
+            turn_id=updated.turn_id,
+            total_elapsed_ms=_elapsed_ms(total_start),
+        ).info("Scheduled asynchronous card-action finalization")
+        self._logger.bind(
+            event="runtime.card_action.completed",
+            request_id=updated.request_id,
+            status=updated.status,
+            total_elapsed_ms=_elapsed_ms(total_start),
+        ).info("Completed card action handling")
         return CardActionCallbackResult(
             toast_type="success",
             toast_text=f"审批请求 {updated.request_id} 已处理，状态: {updated.status}",
         )
+
+    async def _finalize_card_action_async(self, record: PendingActionRecord) -> None:
+        total_start = time.perf_counter()
+        self._logger.bind(
+            event="runtime.card_action.finalize_started",
+            request_id=record.request_id,
+            turn_id=record.turn_id,
+        ).info("Started asynchronous card-action finalization")
+        prompt_update_start = time.perf_counter()
+        try:
+            self._context.approval_service.finalize_response_side_effects(record)
+            self._logger.bind(
+                event="runtime.card_action.prompt_finalized",
+                request_id=record.request_id,
+                elapsed_ms=_elapsed_ms(prompt_update_start),
+                total_elapsed_ms=_elapsed_ms(total_start),
+            ).info("Finalized approval prompt side effects")
+        except Exception:
+            self._logger.bind(
+                event="runtime.card_action.prompt_finalize_failed",
+                request_id=record.request_id,
+                elapsed_ms=_elapsed_ms(prompt_update_start),
+                total_elapsed_ms=_elapsed_ms(total_start),
+            ).exception("Failed to finalize approval prompt side effects")
+
+        if not record.turn_id:
+            self._logger.bind(
+                event="runtime.card_action.finalize_completed",
+                request_id=record.request_id,
+                turn_id=record.turn_id,
+                total_elapsed_ms=_elapsed_ms(total_start),
+            ).info("Completed asynchronous card-action finalization")
+            return
+
+        followup_start = time.perf_counter()
+        try:
+            started_followup = await self._context.reply_service.start_followup_turn(record.turn_id)
+            self._logger.bind(
+                event="runtime.card_action.followup_reply_started",
+                request_id=record.request_id,
+                turn_id=record.turn_id,
+                started=started_followup,
+                elapsed_ms=_elapsed_ms(followup_start),
+                total_elapsed_ms=_elapsed_ms(total_start),
+            ).info("Prepared follow-up reply stream after approval")
+        except Exception:
+            self._logger.bind(
+                event="runtime.card_action.followup_reply_failed",
+                request_id=record.request_id,
+                turn_id=record.turn_id,
+                elapsed_ms=_elapsed_ms(followup_start),
+                total_elapsed_ms=_elapsed_ms(total_start),
+            ).exception("Failed to prepare follow-up reply stream after approval")
+        self._logger.bind(
+            event="runtime.card_action.finalize_completed",
+            request_id=record.request_id,
+            turn_id=record.turn_id,
+            total_elapsed_ms=_elapsed_ms(total_start),
+        ).info("Completed asynchronous card-action finalization")
 
     async def _handle_codex_notification(self, notification: CodexNotification) -> None:
         try:

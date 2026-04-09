@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import json
+import time
 import uuid
 
 import lark_oapi as lark
@@ -70,10 +71,15 @@ class FeishuReplyCardRef:
     card_id: str
 
 
+def _elapsed_ms(start_time: float) -> int:
+    return int((time.perf_counter() - start_time) * 1000)
+
+
 class FeishuAdapter:
     """Wrap the official Feishu SDK behind project-specific interfaces."""
 
     _STREAMING_CARD_CONTENT_ELEMENT_ID = "content"
+    _STREAMING_CARD_STATUS_ELEMENT_ID = "status"
 
     def __init__(
         self,
@@ -324,26 +330,36 @@ class FeishuAdapter:
         )
 
     def update_text(self, *, message_id: str, text: str) -> str:
-        response = self._client.im.v1.message.update(
-            UpdateMessageRequest.builder()
-            .message_id(message_id)
-            .request_body(
-                UpdateMessageRequestBody.builder()
-                .msg_type("text")
-                .content(self._json_content({"text": text}))
+        start_time = time.perf_counter()
+        try:
+            response = self._client.im.v1.message.update(
+                UpdateMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(
+                    UpdateMessageRequestBody.builder()
+                    .msg_type("text")
+                    .content(self._json_content({"text": text}))
+                    .build()
+                )
                 .build()
             )
-            .build()
-        )
-        self._ensure_success(response, action="update_message", key=message_id)
-        updated_message_id = getattr(response.data, "message_id", None)
-        if not updated_message_id:
-            raise FeishuApiError("Feishu update_message succeeded but message_id is missing")
-        self._logger.bind(
-            event="feishu.message.updated",
-            feishu_message_id=updated_message_id,
-        ).info("Feishu message updated")
-        return updated_message_id
+            self._ensure_success(response, action="update_message", key=message_id)
+            updated_message_id = getattr(response.data, "message_id", None)
+            if not updated_message_id:
+                raise FeishuApiError("Feishu update_message succeeded but message_id is missing")
+            self._logger.bind(
+                event="feishu.message.updated",
+                feishu_message_id=updated_message_id,
+                elapsed_ms=_elapsed_ms(start_time),
+            ).info("Feishu message updated")
+            return updated_message_id
+        except Exception:
+            self._logger.bind(
+                event="feishu.message.update_failed",
+                feishu_message_id=message_id,
+                elapsed_ms=_elapsed_ms(start_time),
+            ).exception("Failed to update Feishu text message")
+            raise
 
     def create_streaming_card(self, *, text: str, status: str) -> str:
         payload = self._build_streaming_card_payload(
@@ -352,32 +368,43 @@ class FeishuAdapter:
         )
         request_type = "card_json"
         request_data = self._json_content(payload)
+        start_time = time.perf_counter()
         self._logger.bind(
             event="feishu.card.create.request",
             request_type=request_type,
             request_data=request_data,
         ).info("Creating Feishu streaming card")
-        response = self._client.cardkit.v1.card.create(
-            CreateCardRequest.builder()
-            .request_body(
-                CreateCardRequestBody.builder()
-                .type(request_type)
-                .data(request_data)
+        try:
+            response = self._client.cardkit.v1.card.create(
+                CreateCardRequest.builder()
+                .request_body(
+                    CreateCardRequestBody.builder()
+                    .type(request_type)
+                    .data(request_data)
+                    .build()
+                )
                 .build()
             )
-            .build()
-        )
-        self._ensure_success(response, action="create_streaming_card", key=status)
-        card_id = getattr(response.data, "card_id", None)
-        if not card_id:
-            raise FeishuApiError("Feishu create_streaming_card succeeded but card_id is missing")
-        self._logger.bind(
-            event="feishu.card.created",
-            card_id=card_id,
-            status=status,
-            text_length=len(text),
-        ).info("Created Feishu streaming card")
-        return card_id
+            self._ensure_success(response, action="create_streaming_card", key=status)
+            card_id = getattr(response.data, "card_id", None)
+            if not card_id:
+                raise FeishuApiError("Feishu create_streaming_card succeeded but card_id is missing")
+            self._logger.bind(
+                event="feishu.card.created",
+                card_id=card_id,
+                status=status,
+                text_length=len(text),
+                elapsed_ms=_elapsed_ms(start_time),
+            ).info("Created Feishu streaming card")
+            return card_id
+        except Exception:
+            self._logger.bind(
+                event="feishu.card.create_failed",
+                status=status,
+                text_length=len(text),
+                elapsed_ms=_elapsed_ms(start_time),
+            ).exception("Failed to create Feishu streaming card")
+            raise
 
     def enable_streaming_card(self, *, card_id: str, sequence: int) -> None:
         self._set_streaming_card_mode(
@@ -400,29 +427,41 @@ class FeishuAdapter:
         enabled: bool,
         sequence: int,
     ) -> None:
-        response = self._client.cardkit.v1.card.settings(
-            SettingsCardRequest.builder()
-            .card_id(card_id)
-            .request_body(
-                SettingsCardRequestBody.builder()
-                .settings(self._json_content({"config": {"streaming_mode": enabled}}))
-                .uuid(uuid.uuid4().hex)
-                .sequence(sequence)
+        start_time = time.perf_counter()
+        try:
+            response = self._client.cardkit.v1.card.settings(
+                SettingsCardRequest.builder()
+                .card_id(card_id)
+                .request_body(
+                    SettingsCardRequestBody.builder()
+                    .settings(self._json_content({"config": {"streaming_mode": enabled}}))
+                    .uuid(uuid.uuid4().hex)
+                    .sequence(sequence)
+                    .build()
+                )
                 .build()
             )
-            .build()
-        )
-        self._ensure_success(
-            response,
-            action="enable_streaming_card" if enabled else "disable_streaming_card",
-            key=card_id,
-        )
-        self._logger.bind(
-            event="feishu.card.streaming_mode_updated",
-            card_id=card_id,
-            enabled=enabled,
-            sequence=sequence,
-        ).info("Updated Feishu card streaming mode")
+            self._ensure_success(
+                response,
+                action="enable_streaming_card" if enabled else "disable_streaming_card",
+                key=card_id,
+            )
+            self._logger.bind(
+                event="feishu.card.streaming_mode_updated",
+                card_id=card_id,
+                enabled=enabled,
+                sequence=sequence,
+                elapsed_ms=_elapsed_ms(start_time),
+            ).info("Updated Feishu card streaming mode")
+        except Exception:
+            self._logger.bind(
+                event="feishu.card.streaming_mode_update_failed",
+                card_id=card_id,
+                enabled=enabled,
+                sequence=sequence,
+                elapsed_ms=_elapsed_ms(start_time),
+            ).exception("Failed to update Feishu card streaming mode")
+            raise
 
     def update_streaming_card(
         self,
@@ -431,35 +470,29 @@ class FeishuAdapter:
         text: str,
         status: str,
         sequence: int,
-    ) -> None:
-        self._logger.bind(
-            event="feishu.card.content.request",
+    ) -> int:
+        start_time = time.perf_counter()
+        self._update_card_element_content(
             card_id=card_id,
             element_id=self._STREAMING_CARD_CONTENT_ELEMENT_ID,
-            request_content=self._build_streaming_card_content(text=text, status=status),
+            content=self._build_streaming_card_content(text=text),
             sequence=sequence,
-        ).info("Updating Feishu streaming card content")
-        response = self._client.cardkit.v1.card_element.content(
-            ContentCardElementRequest.builder()
-            .card_id(card_id)
-            .element_id(self._STREAMING_CARD_CONTENT_ELEMENT_ID)
-            .request_body(
-                ContentCardElementRequestBody.builder()
-                .content(self._build_streaming_card_content(text=text, status=status))
-                .uuid(uuid.uuid4().hex)
-                .sequence(sequence)
-                .build()
-            )
-            .build()
         )
-        self._ensure_success(response, action="update_streaming_card", key=card_id)
+        self._update_card_element_content(
+            card_id=card_id,
+            element_id=self._STREAMING_CARD_STATUS_ELEMENT_ID,
+            content=self._build_streaming_status_content(status=status),
+            sequence=sequence + 1,
+        )
         self._logger.bind(
             event="feishu.card.content.updated",
             card_id=card_id,
             status=status,
             sequence=sequence,
             text_length=len(text),
+            elapsed_ms=_elapsed_ms(start_time),
         ).info("Updated Feishu streaming card content")
+        return 2
 
     def add_reaction(self, *, message_id: str, emoji_type: str) -> str:
         response = self._client.im.v1.message_reaction.create(
@@ -519,26 +552,36 @@ class FeishuAdapter:
         )
 
     def update_approval_message(self, *, message_id: str, card_payload: dict[str, object]) -> str:
-        response = self._client.im.v1.message.update(
-            UpdateMessageRequest.builder()
-            .message_id(message_id)
-            .request_body(
-                UpdateMessageRequestBody.builder()
-                .msg_type("interactive")
-                .content(self._json_content(card_payload))
+        start_time = time.perf_counter()
+        try:
+            response = self._client.im.v1.message.update(
+                UpdateMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(
+                    UpdateMessageRequestBody.builder()
+                    .msg_type("interactive")
+                    .content(self._json_content(card_payload))
+                    .build()
+                )
                 .build()
             )
-            .build()
-        )
-        self._ensure_success(response, action="update_message", key=message_id)
-        updated_message_id = getattr(response.data, "message_id", None)
-        if not updated_message_id:
-            raise FeishuApiError("Feishu update_message succeeded but message_id is missing")
-        self._logger.bind(
-            event="feishu.message.updated",
-            feishu_message_id=updated_message_id,
-        ).info("Feishu message updated")
-        return updated_message_id
+            self._ensure_success(response, action="update_message", key=message_id)
+            updated_message_id = getattr(response.data, "message_id", None)
+            if not updated_message_id:
+                raise FeishuApiError("Feishu update_message succeeded but message_id is missing")
+            self._logger.bind(
+                event="feishu.approval_message.updated",
+                feishu_message_id=updated_message_id,
+                elapsed_ms=_elapsed_ms(start_time),
+            ).info("Feishu approval message updated")
+            return updated_message_id
+        except Exception:
+            self._logger.bind(
+                event="feishu.approval_message.update_failed",
+                feishu_message_id=message_id,
+                elapsed_ms=_elapsed_ms(start_time),
+            ).exception("Failed to update Feishu approval message")
+            raise
 
     def send_user_input_message(
         self,
@@ -706,31 +749,43 @@ class FeishuAdapter:
         msg_type: str,
         content: str,
     ) -> str:
-        response = self._client.im.v1.message.create(
-            CreateMessageRequest.builder()
-            .receive_id_type(receive_id_type)
-            .request_body(
-                CreateMessageRequestBody.builder()
-                .receive_id(receive_id)
-                .msg_type(msg_type)
-                .content(content)
-                .uuid(uuid.uuid4().hex)
+        start_time = time.perf_counter()
+        try:
+            response = self._client.im.v1.message.create(
+                CreateMessageRequest.builder()
+                .receive_id_type(receive_id_type)
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(receive_id)
+                    .msg_type(msg_type)
+                    .content(content)
+                    .uuid(uuid.uuid4().hex)
+                    .build()
+                )
                 .build()
             )
-            .build()
-        )
-        self._ensure_success(response, action="send_message", key=receive_id)
-        message_id = getattr(response.data, "message_id", None)
-        if not message_id:
-            raise FeishuApiError("Feishu send_message succeeded but message_id is missing")
-        self._logger.bind(
-            event="feishu.message.sent",
-            feishu_message_id=message_id,
-            receive_id=receive_id,
-            receive_id_type=receive_id_type,
-            msg_type=msg_type,
-        ).info("Feishu message sent")
-        return message_id
+            self._ensure_success(response, action="send_message", key=receive_id)
+            message_id = getattr(response.data, "message_id", None)
+            if not message_id:
+                raise FeishuApiError("Feishu send_message succeeded but message_id is missing")
+            self._logger.bind(
+                event="feishu.message.sent",
+                feishu_message_id=message_id,
+                receive_id=receive_id,
+                receive_id_type=receive_id_type,
+                msg_type=msg_type,
+                elapsed_ms=_elapsed_ms(start_time),
+            ).info("Feishu message sent")
+            return message_id
+        except Exception:
+            self._logger.bind(
+                event="feishu.message.send_failed",
+                receive_id=receive_id,
+                receive_id_type=receive_id_type,
+                msg_type=msg_type,
+                elapsed_ms=_elapsed_ms(start_time),
+            ).exception("Failed to send Feishu message")
+            raise
 
     def normalize_card_action_event(self, event: P2CardActionTrigger) -> CardActionCallback:
         header = getattr(event, "header", None)
@@ -794,31 +849,43 @@ class FeishuAdapter:
         content: str,
         reply_in_thread: bool,
     ) -> str:
-        response = self._client.im.v1.message.reply(
-            ReplyMessageRequest.builder()
-            .message_id(message_id)
-            .request_body(
-                ReplyMessageRequestBody.builder()
-                .content(content)
-                .msg_type(msg_type)
-                .reply_in_thread(reply_in_thread)
-                .uuid(uuid.uuid4().hex)
+        start_time = time.perf_counter()
+        try:
+            response = self._client.im.v1.message.reply(
+                ReplyMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(
+                    ReplyMessageRequestBody.builder()
+                    .content(content)
+                    .msg_type(msg_type)
+                    .reply_in_thread(reply_in_thread)
+                    .uuid(uuid.uuid4().hex)
+                    .build()
+                )
                 .build()
             )
-            .build()
-        )
-        self._ensure_success(response, action="reply_message", key=message_id)
-        reply_message_id = getattr(response.data, "message_id", None)
-        if not reply_message_id:
-            raise FeishuApiError("Feishu reply_message succeeded but reply message_id is missing")
-        self._logger.bind(
-            event="feishu.message.replied",
-            feishu_message_id=reply_message_id,
-            source_message_id=message_id,
-            msg_type=msg_type,
-            reply_in_thread=reply_in_thread,
-        ).info("Feishu reply message sent")
-        return reply_message_id
+            self._ensure_success(response, action="reply_message", key=message_id)
+            reply_message_id = getattr(response.data, "message_id", None)
+            if not reply_message_id:
+                raise FeishuApiError("Feishu reply_message succeeded but reply message_id is missing")
+            self._logger.bind(
+                event="feishu.message.replied",
+                feishu_message_id=reply_message_id,
+                source_message_id=message_id,
+                msg_type=msg_type,
+                reply_in_thread=reply_in_thread,
+                elapsed_ms=_elapsed_ms(start_time),
+            ).info("Feishu reply message sent")
+            return reply_message_id
+        except Exception:
+            self._logger.bind(
+                event="feishu.message.reply_failed",
+                source_message_id=message_id,
+                msg_type=msg_type,
+                reply_in_thread=reply_in_thread,
+                elapsed_ms=_elapsed_ms(start_time),
+            ).exception("Failed to reply Feishu message")
+            raise
 
     def _extract_parts(
         self,
@@ -1027,20 +1094,83 @@ class FeishuAdapter:
                     {
                         "tag": "markdown",
                         "element_id": self._STREAMING_CARD_CONTENT_ELEMENT_ID,
-                        "content": self._build_streaming_card_content(text=text, status=status),
+                        "content": self._build_streaming_card_content(text=text),
+                    },
+                    {
+                        "tag": "markdown",
+                        "element_id": self._STREAMING_CARD_STATUS_ELEMENT_ID,
+                        "content": self._build_streaming_status_content(status=status),
+                        "text_size": "notation",
+                        "text_align": "left",
+                        "icon": {
+                            "tag": "standard_icon",
+                            "token": "robot_outlined",
+                            "color": "grey-500",
+                        },
                     },
                 ],
             },
         }
 
-    def _build_streaming_card_content(self, *, text: str, status: str) -> str:
+    def _build_streaming_card_content(self, *, text: str) -> str:
+        normalized_text = text.strip() if text.strip() else " "
+        return normalized_text
+
+    def _build_streaming_status_content(self, *, status: str) -> str:
         status_text = {
-            "streaming": "正在思考中",
+            "streaming": "正在思考中...",
             "completed": "已完成",
             "failed": "回复已中断",
         }.get(status, "处理中")
-        normalized_text = text.strip() if text.strip() else " "
-        return f"> {status_text}\n\n{normalized_text}"
+        return f"<font color='grey-500'>{status_text}</font>"
+
+    def _update_card_element_content(
+        self,
+        *,
+        card_id: str,
+        element_id: str,
+        content: str,
+        sequence: int,
+    ) -> None:
+        start_time = time.perf_counter()
+        self._logger.bind(
+            event="feishu.card.content.request",
+            card_id=card_id,
+            element_id=element_id,
+            request_content=content,
+            sequence=sequence,
+        ).info("Updating Feishu streaming card content")
+        try:
+            response = self._client.cardkit.v1.card_element.content(
+                ContentCardElementRequest.builder()
+                .card_id(card_id)
+                .element_id(element_id)
+                .request_body(
+                    ContentCardElementRequestBody.builder()
+                    .content(content)
+                    .uuid(uuid.uuid4().hex)
+                    .sequence(sequence)
+                    .build()
+                )
+                .build()
+            )
+            self._ensure_success(response, action="update_streaming_card", key=f"{card_id}:{element_id}")
+            self._logger.bind(
+                event="feishu.card.content.element_updated",
+                card_id=card_id,
+                element_id=element_id,
+                sequence=sequence,
+                elapsed_ms=_elapsed_ms(start_time),
+            ).info("Updated Feishu card element content")
+        except Exception:
+            self._logger.bind(
+                event="feishu.card.content.element_update_failed",
+                card_id=card_id,
+                element_id=element_id,
+                sequence=sequence,
+                elapsed_ms=_elapsed_ms(start_time),
+            ).exception("Failed to update Feishu card element content")
+            raise
 
     def _require_value(self, value: str | None, field_name: str) -> str:
         if value:

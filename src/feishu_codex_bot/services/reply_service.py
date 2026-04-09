@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import time
 from typing import Literal
 
 from feishu_codex_bot.adapters.codex_output_classifier import CodexOutputClassifier
@@ -27,6 +28,10 @@ _DEFAULT_PLACEHOLDER_TEXT = "正在思考..."
 _DEFAULT_FAILURE_TEXT = "本次回复已中断，请稍后重试。"
 _MAX_STREAMING_UPDATES_PER_SECOND = 10
 _MIN_UPDATE_INTERVAL_SECONDS = 1 / _MAX_STREAMING_UPDATES_PER_SECOND
+
+
+def _elapsed_ms(start_time: float) -> int:
+    return int((time.perf_counter() - start_time) * 1000)
 
 
 @dataclass(slots=True)
@@ -64,7 +69,7 @@ class ReplyService:
         classifier: CodexOutputClassifier | None = None,
         logger: ContextLoggerAdapter | None = None,
         update_interval_seconds: float = _MIN_UPDATE_INTERVAL_SECONDS,
-        typing_emoji_type: str = "typing",
+        typing_emoji_type: str = "Typing",
         placeholder_text: str = _DEFAULT_PLACEHOLDER_TEXT,
         failure_text: str = _DEFAULT_FAILURE_TEXT,
     ) -> None:
@@ -110,6 +115,7 @@ class ReplyService:
                     session_scope_key=session_scope_key,
                     feishu_message_id=source_message_id,
                     turn_id=turn_id,
+                    emoji_type=self._typing_emoji_type,
                 ).exception("Failed to add typing reaction")
 
             record = self._reply_repository.create_reply(
@@ -174,6 +180,7 @@ class ReplyService:
         return True
 
     async def start_followup_turn(self, turn_id: str) -> bool:
+        total_start = time.perf_counter()
         state = self._streams_by_turn.get(turn_id)
         if state is None:
             return False
@@ -200,14 +207,31 @@ class ReplyService:
             except asyncio.CancelledError:
                 pass
 
+        complete_previous_card_start = time.perf_counter()
         await self._complete_current_card_for_followup(state)
+        self._logger.bind(
+            event="reply.turn.followup.previous_card_completed",
+            turn_id=turn_id,
+            elapsed_ms=_elapsed_ms(complete_previous_card_start),
+            total_elapsed_ms=_elapsed_ms(total_start),
+        ).info("Completed previous reply card before follow-up")
 
+        create_reply_card_start = time.perf_counter()
         reply_card = self._feishu_adapter.reply_streaming_card(
             message_id=source_message_id,
             text=self._placeholder_text,
             reply_in_thread=reply_in_thread,
             status="streaming",
         )
+        self._logger.bind(
+            event="reply.turn.followup.reply_card_created",
+            turn_id=turn_id,
+            reply_message_id=reply_card.message_id,
+            reply_card_id=reply_card.card_id,
+            elapsed_ms=_elapsed_ms(create_reply_card_start),
+            total_elapsed_ms=_elapsed_ms(total_start),
+        ).info("Created follow-up reply card")
+        persistence_start = time.perf_counter()
         self._reply_repository.update_reply(
             bot_app_id=self._config.feishu.app_id,
             reply_message_id=previous_reply_message_id,
@@ -223,7 +247,16 @@ class ReplyService:
             status="streaming",
             reaction_applied=reaction_applied,
         )
+        self._logger.bind(
+            event="reply.turn.followup.persistence_updated",
+            turn_id=turn_id,
+            previous_reply_message_id=previous_reply_message_id,
+            reply_message_id=reply_card.message_id,
+            elapsed_ms=_elapsed_ms(persistence_start),
+            total_elapsed_ms=_elapsed_ms(total_start),
+        ).info("Persisted follow-up reply records")
 
+        memory_state_start = time.perf_counter()
         async with state.lock:
             if state.closed:
                 return False
@@ -236,6 +269,14 @@ class ReplyService:
             state.agent_item_id = None
             state.status = "streaming"
             state.dirty = False
+        self._logger.bind(
+            event="reply.turn.followup.memory_state_updated",
+            turn_id=turn_id,
+            reply_message_id=reply_card.message_id,
+            reply_card_id=reply_card.card_id,
+            elapsed_ms=_elapsed_ms(memory_state_start),
+            total_elapsed_ms=_elapsed_ms(total_start),
+        ).info("Updated in-memory follow-up reply state")
 
         self._logger.bind(
             event="reply.turn.followup_started",
@@ -247,6 +288,7 @@ class ReplyService:
             reply_card_id=reply_card.card_id,
             thread_id=thread_id,
             turn_id=turn_id,
+            total_elapsed_ms=_elapsed_ms(total_start),
         ).info("Started follow-up streaming reply turn")
         return True
 
@@ -351,13 +393,11 @@ class ReplyService:
             target_text = state.aggregated_text or state.placeholder_text
             if not force and (not state.dirty or target_text == state.last_sent_text):
                 return
-            state.dirty = False
             sequence = state.next_sequence
-            state.next_sequence += 1
             status = state.status
 
         try:
-            self._feishu_adapter.update_streaming_card(
+            consumed_sequences = self._feishu_adapter.update_streaming_card(
                 card_id=state.reply_card_id,
                 text=target_text,
                 status=status,
@@ -380,6 +420,8 @@ class ReplyService:
 
         async with state.lock:
             state.last_sent_text = target_text
+            state.next_sequence = sequence + consumed_sequences
+            state.dirty = False
 
         self._reply_repository.update_reply(
             bot_app_id=self._config.feishu.app_id,
@@ -405,12 +447,15 @@ class ReplyService:
                 return
             card_id = state.reply_card_id
             sequence = state.next_sequence
-            state.next_sequence += 1
 
         self._feishu_adapter.disable_streaming_card(
             card_id=card_id,
             sequence=sequence,
         )
+        async with state.lock:
+            if state.closed:
+                return
+            state.next_sequence = sequence + 1
         self._logger.bind(
             event="reply.card.streaming_closed",
             session_scope_key=state.session_scope_key,

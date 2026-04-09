@@ -201,3 +201,47 @@ def test_submit_approval_response_updates_card_summary(tmp_path: Path) -> None:
     assert updated_payload["header"]["title"]["content"] == "审批已处理"
     assert len(updated_payload["body"]["elements"]) == 1
     assert "已同意" in updated_payload["body"]["elements"][0]["content"]
+
+
+def test_submit_approval_response_can_defer_prompt_update(tmp_path: Path) -> None:
+    service, codex_client, feishu_adapter, repository = _build_service(tmp_path)
+    request = CodexServerRequest(
+        id="req-3",
+        method="item/fileChange/requestApproval",
+        params={
+            "reason": "apply patch",
+            "grantRoot": "/workspace",
+        },
+        thread_id="thread-3",
+        turn_id="turn-3",
+        item_id="item-3",
+    )
+
+    async def _run() -> None:
+        await service.handle_server_request(
+            request,
+            context=ApprovalRequestContext(
+                session_scope_key="scope-3",
+                source_message_id="om-source-3",
+                chat_id="oc_chat_3",
+            ),
+        )
+        await service.submit_approval_response(
+            "req-3",
+            "accept",
+            update_prompt=False,
+        )
+
+    asyncio.run(_run())
+
+    assert codex_client.responses == [("req-3", {"decision": "accept"})]
+    assert feishu_adapter.updated_cards == []
+
+    record = repository.get_by_request_id("req-3")
+    assert record is not None
+    service.finalize_response_side_effects(record)
+
+    assert len(feishu_adapter.updated_cards) == 1
+    updated_payload = feishu_adapter.updated_cards[0]["card_payload"]
+    assert updated_payload["header"]["title"]["content"] == "审批已处理"
+    assert "已同意" in updated_payload["body"]["elements"][0]["content"]
