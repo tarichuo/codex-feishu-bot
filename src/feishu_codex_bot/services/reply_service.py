@@ -171,6 +171,83 @@ class ReplyService:
         )
         return True
 
+    async def start_followup_turn(self, turn_id: str) -> bool:
+        state = self._streams_by_turn.get(turn_id)
+        if state is None:
+            return False
+
+        flush_task: asyncio.Task[None] | None = None
+        async with state.lock:
+            if state.closed:
+                return False
+            flush_task = state.flush_task
+            state.flush_task = None
+            previous_reply_message_id = state.reply_message_id
+            previous_reply_card_id = state.reply_card_id
+            reaction_applied = state.reaction_id is not None
+            source_message_id = state.source_message_id
+            reply_in_thread = state.reply_in_thread
+            session_scope_key = state.session_scope_key
+            thread_id = state.thread_id
+            turn_id = state.turn_id
+
+        if flush_task is not None:
+            flush_task.cancel()
+            try:
+                await flush_task
+            except asyncio.CancelledError:
+                pass
+
+        await self._flush_state(state, force=False)
+
+        reply_card = self._feishu_adapter.reply_streaming_card(
+            message_id=source_message_id,
+            text=self._placeholder_text,
+            reply_in_thread=reply_in_thread,
+            status="streaming",
+        )
+        self._reply_repository.update_reply(
+            bot_app_id=self._config.feishu.app_id,
+            reply_message_id=previous_reply_message_id,
+            status="superseded",
+            reaction_applied=reaction_applied,
+        )
+        self._reply_repository.create_reply(
+            bot_app_id=self._config.feishu.app_id,
+            feishu_message_id=source_message_id,
+            reply_message_id=reply_card.message_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            status="streaming",
+            reaction_applied=reaction_applied,
+        )
+
+        async with state.lock:
+            if state.closed:
+                return False
+            state.reply_message_id = reply_card.message_id
+            state.reply_card_id = reply_card.card_id
+            state.placeholder_text = self._placeholder_text
+            state.last_sent_text = self._placeholder_text
+            state.next_sequence = 2
+            state.aggregated_text = ""
+            state.agent_item_id = None
+            state.status = "streaming"
+            state.dirty = False
+
+        self._logger.bind(
+            event="reply.turn.followup_started",
+            session_scope_key=session_scope_key,
+            source_message_id=source_message_id,
+            previous_reply_message_id=previous_reply_message_id,
+            previous_reply_card_id=previous_reply_card_id,
+            reply_message_id=reply_card.message_id,
+            reply_card_id=reply_card.card_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+        ).info("Started follow-up streaming reply turn")
+        return True
+
     async def close(self) -> None:
         turn_ids = list(self._streams_by_turn.keys())
         for turn_id in turn_ids:

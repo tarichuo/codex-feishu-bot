@@ -300,3 +300,109 @@ def test_reply_service_fail_turn_updates_failed_card(tmp_path: Path) -> None:
     ]
     assert reply_repository.records["reply-message-1"].status == "failed"
     assert session_executor.completed == [("p2p:ou_owner", "turn-1")]
+
+
+def test_reply_service_starts_new_card_after_approval_followup(tmp_path: Path) -> None:
+    feishu_adapter = _FakeFeishuAdapter()
+    reply_repository = _FakeReplyRepository()
+    session_executor = _FakeSessionExecutor()
+    classifier = _FakeClassifier(
+        CodexTextDeltaEvent(
+            channel="agentMessage",
+            text="审批前方案",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="item-1",
+        ),
+    )
+    service = ReplyService(
+        _build_config(tmp_path),
+        feishu_adapter=feishu_adapter,
+        reply_repository=reply_repository,
+        session_executor=session_executor,
+        classifier=classifier,
+    )
+
+    async def _run() -> None:
+        await service.start_turn(
+            session_scope_key="p2p:ou_owner",
+            source_message_id="om_source",
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
+        await service.handle_notification(
+            CodexNotification(
+                method="notification.before_approval",
+                params={},
+                thread_id="thread-1",
+                turn_id="turn-1",
+                item_id=None,
+                request_id=None,
+            )
+        )
+        await service.start_followup_turn("turn-1")
+        classifier._events = [
+            CodexTextDeltaEvent(
+                channel="agentMessage",
+                text="审批后执行结果",
+                thread_id="thread-1",
+                turn_id="turn-1",
+                item_id="item-2",
+            ),
+            CodexTurnLifecycleEvent(
+                phase="completed",
+                thread_id="thread-1",
+                turn_id="turn-1",
+                status="completed",
+                error=None,
+            ),
+        ]
+        await service.handle_notification(
+            CodexNotification(
+                method="notification.after_approval",
+                params={},
+                thread_id="thread-1",
+                turn_id="turn-1",
+                item_id=None,
+                request_id=None,
+            )
+        )
+
+    asyncio.run(_run())
+
+    assert feishu_adapter.reply_cards == [
+        {
+            "message_id": "om_source",
+            "text": "正在思考...",
+            "reply_in_thread": False,
+            "status": "streaming",
+        },
+        {
+            "message_id": "om_source",
+            "text": "正在思考...",
+            "reply_in_thread": False,
+            "status": "streaming",
+        },
+    ]
+    assert feishu_adapter.card_updates == [
+        {
+            "card_id": "card-1",
+            "text": "审批前方案",
+            "status": "streaming",
+            "sequence": 2,
+        },
+        {
+            "card_id": "card-2",
+            "text": "审批后执行结果",
+            "status": "streaming",
+            "sequence": 2,
+        },
+        {
+            "card_id": "card-2",
+            "text": "审批后执行结果",
+            "status": "completed",
+            "sequence": 3,
+        },
+    ]
+    assert reply_repository.records["reply-message-1"].status == "superseded"
+    assert reply_repository.records["reply-message-2"].status == "completed"

@@ -314,6 +314,14 @@ class ApplicationRuntime:
             decision,
             scope=scope,
         )
+        if updated.turn_id:
+            started_followup = await self._context.reply_service.start_followup_turn(updated.turn_id)
+            self._logger.bind(
+                event="runtime.card_action.followup_reply_started",
+                request_id=updated.request_id,
+                turn_id=updated.turn_id,
+                started=started_followup,
+            ).info("Prepared follow-up reply stream after approval")
         return CardActionCallbackResult(
             toast_type="success",
             toast_text=f"审批请求 {updated.request_id} 已处理，状态: {updated.status}",
@@ -422,6 +430,15 @@ class ApplicationRuntime:
                 text=f"处理审批响应失败: {exc}",
             )
             return
+
+        if updated.turn_id:
+            started_followup = await self._context.reply_service.start_followup_turn(updated.turn_id)
+            self._logger.bind(
+                event="runtime.control_approve.followup_reply_started",
+                request_id=updated.request_id,
+                turn_id=updated.turn_id,
+                started=started_followup,
+            ).info("Prepared follow-up reply stream after control approval")
 
         self._context.feishu_adapter.reply_text(
             message_id=message.message_id,
