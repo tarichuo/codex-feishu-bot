@@ -380,24 +380,49 @@ class FeishuAdapter:
         return card_id
 
     def enable_streaming_card(self, *, card_id: str, sequence: int) -> None:
+        self._set_streaming_card_mode(
+            card_id=card_id,
+            enabled=True,
+            sequence=sequence,
+        )
+
+    def disable_streaming_card(self, *, card_id: str, sequence: int) -> None:
+        self._set_streaming_card_mode(
+            card_id=card_id,
+            enabled=False,
+            sequence=sequence,
+        )
+
+    def _set_streaming_card_mode(
+        self,
+        *,
+        card_id: str,
+        enabled: bool,
+        sequence: int,
+    ) -> None:
         response = self._client.cardkit.v1.card.settings(
             SettingsCardRequest.builder()
             .card_id(card_id)
             .request_body(
                 SettingsCardRequestBody.builder()
-                .settings(self._json_content({"config": {"streaming_mode": True}}))
+                .settings(self._json_content({"config": {"streaming_mode": enabled}}))
                 .uuid(uuid.uuid4().hex)
                 .sequence(sequence)
                 .build()
             )
             .build()
         )
-        self._ensure_success(response, action="enable_streaming_card", key=card_id)
+        self._ensure_success(
+            response,
+            action="enable_streaming_card" if enabled else "disable_streaming_card",
+            key=card_id,
+        )
         self._logger.bind(
-            event="feishu.card.streaming_enabled",
+            event="feishu.card.streaming_mode_updated",
             card_id=card_id,
+            enabled=enabled,
             sequence=sequence,
-        ).info("Enabled Feishu card streaming mode")
+        ).info("Updated Feishu card streaming mode")
 
     def update_streaming_card(
         self,

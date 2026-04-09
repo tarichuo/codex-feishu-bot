@@ -44,6 +44,7 @@ class _FakeFeishuAdapter:
     def __init__(self) -> None:
         self.reply_cards: list[dict[str, object]] = []
         self.card_updates: list[dict[str, object]] = []
+        self.card_streaming_modes: list[dict[str, object]] = []
         self.added_reactions: list[dict[str, str]] = []
         self.removed_reactions: list[dict[str, str]] = []
 
@@ -88,6 +89,15 @@ class _FakeFeishuAdapter:
                 "card_id": card_id,
                 "text": text,
                 "status": status,
+                "sequence": sequence,
+            }
+        )
+
+    def disable_streaming_card(self, *, card_id: str, sequence: int) -> None:
+        self.card_streaming_modes.append(
+            {
+                "card_id": card_id,
+                "enabled": False,
                 "sequence": sequence,
             }
         )
@@ -255,6 +265,13 @@ def test_reply_service_uses_streaming_card_updates(tmp_path: Path) -> None:
             "sequence": 3,
         },
     ]
+    assert feishu_adapter.card_streaming_modes == [
+        {
+            "card_id": "card-1",
+            "enabled": False,
+            "sequence": 4,
+        }
+    ]
     assert feishu_adapter.removed_reactions == [
         {
             "message_id": "om_source",
@@ -296,6 +313,13 @@ def test_reply_service_fail_turn_updates_failed_card(tmp_path: Path) -> None:
             "text": "本次回复已中断，请稍后重试。",
             "status": "failed",
             "sequence": 2,
+        }
+    ]
+    assert feishu_adapter.card_streaming_modes == [
+        {
+            "card_id": "card-1",
+            "enabled": False,
+            "sequence": 3,
         }
     ]
     assert reply_repository.records["reply-message-1"].status == "failed"
@@ -392,6 +416,12 @@ def test_reply_service_starts_new_card_after_approval_followup(tmp_path: Path) -
             "sequence": 2,
         },
         {
+            "card_id": "card-1",
+            "text": "审批前方案",
+            "status": "completed",
+            "sequence": 3,
+        },
+        {
             "card_id": "card-2",
             "text": "审批后执行结果",
             "status": "streaming",
@@ -404,5 +434,29 @@ def test_reply_service_starts_new_card_after_approval_followup(tmp_path: Path) -
             "sequence": 3,
         },
     ]
+    assert feishu_adapter.card_streaming_modes == [
+        {
+            "card_id": "card-1",
+            "enabled": False,
+            "sequence": 4,
+        },
+        {
+            "card_id": "card-2",
+            "enabled": False,
+            "sequence": 4,
+        },
+    ]
     assert reply_repository.records["reply-message-1"].status == "superseded"
     assert reply_repository.records["reply-message-2"].status == "completed"
+
+
+def test_reply_service_caps_update_rate_at_ten_per_second(tmp_path: Path) -> None:
+    service = ReplyService(
+        _build_config(tmp_path),
+        feishu_adapter=_FakeFeishuAdapter(),
+        reply_repository=_FakeReplyRepository(),
+        session_executor=_FakeSessionExecutor(),
+        update_interval_seconds=0.01,
+    )
+
+    assert service._update_interval_seconds == 0.1

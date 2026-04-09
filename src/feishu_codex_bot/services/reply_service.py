@@ -25,6 +25,8 @@ ReplyStreamStatus = Literal["streaming", "completed", "failed"]
 
 _DEFAULT_PLACEHOLDER_TEXT = "正在思考..."
 _DEFAULT_FAILURE_TEXT = "本次回复已中断，请稍后重试。"
+_MAX_STREAMING_UPDATES_PER_SECOND = 10
+_MIN_UPDATE_INTERVAL_SECONDS = 1 / _MAX_STREAMING_UPDATES_PER_SECOND
 
 
 @dataclass(slots=True)
@@ -61,7 +63,7 @@ class ReplyService:
         session_executor: SessionExecutor,
         classifier: CodexOutputClassifier | None = None,
         logger: ContextLoggerAdapter | None = None,
-        update_interval_seconds: float = 0.3,
+        update_interval_seconds: float = _MIN_UPDATE_INTERVAL_SECONDS,
         typing_emoji_type: str = "typing",
         placeholder_text: str = _DEFAULT_PLACEHOLDER_TEXT,
         failure_text: str = _DEFAULT_FAILURE_TEXT,
@@ -72,7 +74,7 @@ class ReplyService:
         self._session_executor = session_executor
         self._classifier = classifier or CodexOutputClassifier()
         self._logger = logger or get_logger(__name__, bot_app_id=config.feishu.app_id)
-        self._update_interval_seconds = max(update_interval_seconds, 0.05)
+        self._update_interval_seconds = max(update_interval_seconds, _MIN_UPDATE_INTERVAL_SECONDS)
         self._typing_emoji_type = typing_emoji_type
         self._placeholder_text = placeholder_text
         self._failure_text = failure_text
@@ -198,7 +200,7 @@ class ReplyService:
             except asyncio.CancelledError:
                 pass
 
-        await self._flush_state(state, force=False)
+        await self._complete_current_card_for_followup(state)
 
         reply_card = self._feishu_adapter.reply_streaming_card(
             message_id=source_message_id,
@@ -397,6 +399,56 @@ class ReplyService:
             force=force,
         ).info("Flushed reply text to Feishu")
 
+    async def _close_streaming_card(self, state: _ReplyStreamState) -> None:
+        async with state.lock:
+            if state.closed:
+                return
+            card_id = state.reply_card_id
+            sequence = state.next_sequence
+            state.next_sequence += 1
+
+        self._feishu_adapter.disable_streaming_card(
+            card_id=card_id,
+            sequence=sequence,
+        )
+        self._logger.bind(
+            event="reply.card.streaming_closed",
+            session_scope_key=state.session_scope_key,
+            reply_message_id=state.reply_message_id,
+            reply_card_id=card_id,
+            turn_id=state.turn_id,
+            sequence=sequence,
+        ).info("Closed Feishu streaming mode for reply card")
+
+    async def _complete_current_card_for_followup(self, state: _ReplyStreamState) -> None:
+        async with state.lock:
+            if state.closed:
+                return
+            state.status = "completed"
+            state.dirty = True
+
+        try:
+            await self._flush_state(state, force=True)
+        except Exception:
+            self._logger.bind(
+                event="reply.followup.flush_failed",
+                session_scope_key=state.session_scope_key,
+                reply_message_id=state.reply_message_id,
+                reply_card_id=state.reply_card_id,
+                turn_id=state.turn_id,
+            ).exception("Failed to finalize previous reply card before follow-up")
+
+        try:
+            await self._close_streaming_card(state)
+        except Exception:
+            self._logger.bind(
+                event="reply.followup.streaming_close_failed",
+                session_scope_key=state.session_scope_key,
+                reply_message_id=state.reply_message_id,
+                reply_card_id=state.reply_card_id,
+                turn_id=state.turn_id,
+            ).exception("Failed to close previous reply card streaming mode before follow-up")
+
     async def _finalize_state(
         self,
         state: _ReplyStreamState,
@@ -434,6 +486,18 @@ class ReplyService:
                 turn_id=state.turn_id,
                 status=status,
             ).exception("Failed to flush final reply text")
+
+        try:
+            await self._close_streaming_card(state)
+        except Exception:
+            self._logger.bind(
+                event="reply.finalize.streaming_close_failed",
+                session_scope_key=state.session_scope_key,
+                reply_message_id=state.reply_message_id,
+                reply_card_id=state.reply_card_id,
+                turn_id=state.turn_id,
+                status=status,
+            ).exception("Failed to close reply card streaming mode")
 
         if state.reaction_id is not None:
             try:
