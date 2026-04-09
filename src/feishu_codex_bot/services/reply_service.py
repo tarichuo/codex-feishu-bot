@@ -38,8 +38,8 @@ def _elapsed_ms(start_time: float) -> int:
 class _ReplyStreamState:
     session_scope_key: str
     source_message_id: str
-    reply_message_id: str
-    reply_card_id: str
+    reply_message_id: str | None
+    reply_card_id: str | None
     thread_id: str
     turn_id: str
     reply_in_thread: bool
@@ -52,6 +52,7 @@ class _ReplyStreamState:
     status: ReplyStreamStatus = "streaming"
     flush_task: asyncio.Task[None] | None = None
     dirty: bool = False
+    flushing: bool = False
     closed: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -93,17 +94,11 @@ class ReplyService:
         thread_id: str,
         turn_id: str,
         reply_in_thread: bool = False,
-    ) -> ReplyMessageRecord:
+    ) -> ReplyMessageRecord | None:
         await self._session_executor.activate_turn(session_scope_key, turn_id)
 
         reaction_id: str | None = None
         try:
-            reply_card = self._feishu_adapter.reply_streaming_card(
-                message_id=source_message_id,
-                text=self._placeholder_text,
-                reply_in_thread=reply_in_thread,
-                status="streaming",
-            )
             try:
                 reaction_id = self._feishu_adapter.add_reaction(
                     message_id=source_message_id,
@@ -118,40 +113,29 @@ class ReplyService:
                     emoji_type=self._typing_emoji_type,
                 ).exception("Failed to add typing reaction")
 
-            record = self._reply_repository.create_reply(
-                bot_app_id=self._config.feishu.app_id,
-                feishu_message_id=source_message_id,
-                reply_message_id=reply_card.message_id,
-                thread_id=thread_id,
-                turn_id=turn_id,
-                status="streaming",
-                reaction_applied=reaction_id is not None,
-            )
             state = _ReplyStreamState(
                 session_scope_key=session_scope_key,
                 source_message_id=source_message_id,
-                reply_message_id=reply_card.message_id,
-                reply_card_id=reply_card.card_id,
+                reply_message_id=None,
+                reply_card_id=None,
                 thread_id=thread_id,
                 turn_id=turn_id,
                 reply_in_thread=reply_in_thread,
                 reaction_id=reaction_id,
                 placeholder_text=self._placeholder_text,
-                last_sent_text=self._placeholder_text,
-                next_sequence=2,
+                last_sent_text="",
+                next_sequence=0,
             )
             self._streams_by_turn[turn_id] = state
             self._logger.bind(
                 event="reply.turn.started",
                 session_scope_key=session_scope_key,
                 feishu_message_id=source_message_id,
-                reply_message_id=reply_card.message_id,
-                reply_card_id=reply_card.card_id,
                 thread_id=thread_id,
                 turn_id=turn_id,
                 reaction_applied=reaction_id is not None,
-            ).info("Started streaming reply turn")
-            return record
+            ).info("Started reply turn without creating reply card yet")
+            return None
         except Exception:
             await self._session_executor.complete_turn(session_scope_key, turn_id)
             raise
@@ -191,6 +175,7 @@ class ReplyService:
                 return False
             flush_task = state.flush_task
             state.flush_task = None
+            had_reply_card = state.reply_message_id is not None and state.reply_card_id is not None
             previous_reply_message_id = state.reply_message_id
             previous_reply_card_id = state.reply_card_id
             reaction_applied = state.reaction_id is not None
@@ -207,76 +192,53 @@ class ReplyService:
             except asyncio.CancelledError:
                 pass
 
-        complete_previous_card_start = time.perf_counter()
-        await self._complete_current_card_for_followup(state)
-        self._logger.bind(
-            event="reply.turn.followup.previous_card_completed",
-            turn_id=turn_id,
-            elapsed_ms=_elapsed_ms(complete_previous_card_start),
-            total_elapsed_ms=_elapsed_ms(total_start),
-        ).info("Completed previous reply card before follow-up")
-
-        create_reply_card_start = time.perf_counter()
-        reply_card = self._feishu_adapter.reply_streaming_card(
-            message_id=source_message_id,
-            text=self._placeholder_text,
-            reply_in_thread=reply_in_thread,
-            status="streaming",
-        )
-        self._logger.bind(
-            event="reply.turn.followup.reply_card_created",
-            turn_id=turn_id,
-            reply_message_id=reply_card.message_id,
-            reply_card_id=reply_card.card_id,
-            elapsed_ms=_elapsed_ms(create_reply_card_start),
-            total_elapsed_ms=_elapsed_ms(total_start),
-        ).info("Created follow-up reply card")
-        persistence_start = time.perf_counter()
-        self._reply_repository.update_reply(
-            bot_app_id=self._config.feishu.app_id,
-            reply_message_id=previous_reply_message_id,
-            status="superseded",
-            reaction_applied=reaction_applied,
-        )
-        self._reply_repository.create_reply(
-            bot_app_id=self._config.feishu.app_id,
-            feishu_message_id=source_message_id,
-            reply_message_id=reply_card.message_id,
-            thread_id=thread_id,
-            turn_id=turn_id,
-            status="streaming",
-            reaction_applied=reaction_applied,
-        )
-        self._logger.bind(
-            event="reply.turn.followup.persistence_updated",
-            turn_id=turn_id,
-            previous_reply_message_id=previous_reply_message_id,
-            reply_message_id=reply_card.message_id,
-            elapsed_ms=_elapsed_ms(persistence_start),
-            total_elapsed_ms=_elapsed_ms(total_start),
-        ).info("Persisted follow-up reply records")
+        if had_reply_card:
+            complete_previous_card_start = time.perf_counter()
+            await self._complete_current_card_for_followup(state)
+            self._logger.bind(
+                event="reply.turn.followup.previous_card_completed",
+                turn_id=turn_id,
+                previous_reply_message_id=previous_reply_message_id,
+                previous_reply_card_id=previous_reply_card_id,
+                elapsed_ms=_elapsed_ms(complete_previous_card_start),
+                total_elapsed_ms=_elapsed_ms(total_start),
+            ).info("Completed previous reply card before follow-up")
+            persistence_start = time.perf_counter()
+            self._reply_repository.update_reply(
+                bot_app_id=self._config.feishu.app_id,
+                reply_message_id=previous_reply_message_id,
+                status="superseded",
+                reaction_applied=reaction_applied,
+            )
+            self._logger.bind(
+                event="reply.turn.followup.persistence_updated",
+                turn_id=turn_id,
+                previous_reply_message_id=previous_reply_message_id,
+                elapsed_ms=_elapsed_ms(persistence_start),
+                total_elapsed_ms=_elapsed_ms(total_start),
+            ).info("Persisted follow-up reply records")
 
         memory_state_start = time.perf_counter()
         async with state.lock:
             if state.closed:
                 return False
-            state.reply_message_id = reply_card.message_id
-            state.reply_card_id = reply_card.card_id
+            state.reply_message_id = None
+            state.reply_card_id = None
             state.placeholder_text = self._placeholder_text
-            state.last_sent_text = self._placeholder_text
-            state.next_sequence = 2
+            state.last_sent_text = ""
+            state.next_sequence = 0
             state.aggregated_text = ""
             state.agent_item_id = None
             state.status = "streaming"
             state.dirty = False
+            state.flushing = False
         self._logger.bind(
             event="reply.turn.followup.memory_state_updated",
             turn_id=turn_id,
-            reply_message_id=reply_card.message_id,
-            reply_card_id=reply_card.card_id,
+            had_previous_reply_card=had_reply_card,
             elapsed_ms=_elapsed_ms(memory_state_start),
             total_elapsed_ms=_elapsed_ms(total_start),
-        ).info("Updated in-memory follow-up reply state")
+        ).info("Reset in-memory follow-up reply state")
 
         self._logger.bind(
             event="reply.turn.followup_started",
@@ -284,12 +246,12 @@ class ReplyService:
             source_message_id=source_message_id,
             previous_reply_message_id=previous_reply_message_id,
             previous_reply_card_id=previous_reply_card_id,
-            reply_message_id=reply_card.message_id,
-            reply_card_id=reply_card.card_id,
+            reply_message_id=None,
+            reply_card_id=None,
             thread_id=thread_id,
             turn_id=turn_id,
             total_elapsed_ms=_elapsed_ms(total_start),
-        ).info("Started follow-up streaming reply turn")
+        ).info("Prepared follow-up turn and will create reply card on first output")
         return True
 
     async def close(self) -> None:
@@ -343,8 +305,10 @@ class ReplyService:
             if item_id is not None:
                 state.agent_item_id = item_id
             state.dirty = True
-            should_flush_immediately = state.flush_task is None and self._flush_is_due(state)
-            if not should_flush_immediately and state.flush_task is None:
+            should_flush_immediately = (
+                state.flush_task is None and not state.flushing and self._flush_is_due(state)
+            )
+            if not should_flush_immediately and state.flush_task is None and not state.flushing:
                 state.flush_task = asyncio.create_task(self._flush_after_delay(state.turn_id))
 
         if should_flush_immediately:
@@ -365,14 +329,18 @@ class ReplyService:
                 state.dirty = True
             if item_id is not None:
                 state.agent_item_id = item_id
-            should_flush_immediately = state.flush_task is None and self._flush_is_due(state)
-            if not should_flush_immediately and state.flush_task is None:
+            should_flush_immediately = (
+                state.flush_task is None and not state.flushing and self._flush_is_due(state)
+            )
+            if not should_flush_immediately and state.flush_task is None and not state.flushing:
                 state.flush_task = asyncio.create_task(self._flush_after_delay(state.turn_id))
 
         if should_flush_immediately:
             await self._flush_state(state, force=False)
 
     def _flush_is_due(self, state: _ReplyStreamState) -> bool:
+        if state.reply_card_id is None:
+            return True
         return state.last_sent_text == state.placeholder_text or not state.dirty
 
     async def _flush_after_delay(self, turn_id: str) -> None:
@@ -386,17 +354,84 @@ class ReplyService:
             raise
 
     async def _flush_state(self, state: _ReplyStreamState, *, force: bool) -> None:
+        create_reply_card = False
+        source_message_id = ""
+        reply_in_thread = False
+        thread_id = ""
+        agent_item_id: str | None = None
+        sequence = 0
+        status: ReplyStreamStatus = "streaming"
+        target_text = ""
         async with state.lock:
             state.flush_task = None
-            if state.closed:
+            if state.closed or state.flushing:
                 return
-            target_text = state.aggregated_text or state.placeholder_text
-            if not force and (not state.dirty or target_text == state.last_sent_text):
-                return
-            sequence = state.next_sequence
-            status = state.status
+            if state.reply_card_id is None:
+                if not state.aggregated_text:
+                    return
+                create_reply_card = True
+                target_text = state.aggregated_text
+                status = state.status
+                source_message_id = state.source_message_id
+                reply_in_thread = state.reply_in_thread
+                thread_id = state.thread_id
+                agent_item_id = state.agent_item_id
+                state.flushing = True
+            else:
+                target_text = state.aggregated_text or state.placeholder_text
+                if not force and (not state.dirty or target_text == state.last_sent_text):
+                    return
+                sequence = state.next_sequence
+                status = state.status
+                state.flushing = True
 
         try:
+            if create_reply_card:
+                reply_card = self._feishu_adapter.reply_streaming_card(
+                    message_id=source_message_id,
+                    text=target_text,
+                    reply_in_thread=reply_in_thread,
+                    status=status,
+                )
+                record = self._reply_repository.create_reply(
+                    bot_app_id=self._config.feishu.app_id,
+                    feishu_message_id=source_message_id,
+                    reply_message_id=reply_card.message_id,
+                    thread_id=thread_id,
+                    turn_id=state.turn_id,
+                    agent_item_id=agent_item_id,
+                    status=status,
+                    reaction_applied=state.reaction_id is not None,
+                )
+                async with state.lock:
+                    if not state.closed:
+                        state.reply_message_id = reply_card.message_id
+                        state.reply_card_id = reply_card.card_id
+                        state.last_sent_text = target_text
+                        state.next_sequence = 2
+                        state.dirty = state.aggregated_text != target_text
+                self._logger.bind(
+                    event="reply.turn.reply_card_created",
+                    session_scope_key=state.session_scope_key,
+                    feishu_message_id=source_message_id,
+                    reply_message_id=reply_card.message_id,
+                    reply_card_id=reply_card.card_id,
+                    thread_id=state.thread_id,
+                    turn_id=state.turn_id,
+                    status=status,
+                    text_length=len(target_text),
+                ).info("Created reply card after first Codex output")
+                self._logger.bind(
+                    event="reply.flushed",
+                    session_scope_key=state.session_scope_key,
+                    reply_message_id=record.reply_message_id,
+                    reply_card_id=reply_card.card_id,
+                    turn_id=state.turn_id,
+                    text_length=len(target_text),
+                    force=force,
+                ).info("Flushed reply text to Feishu")
+                return
+
             consumed_sequences = self._feishu_adapter.update_streaming_card(
                 card_id=state.reply_card_id,
                 text=target_text,
@@ -417,6 +452,9 @@ class ReplyService:
             if force:
                 raise
             return
+        finally:
+            async with state.lock:
+                state.flushing = False
 
         async with state.lock:
             state.last_sent_text = target_text
@@ -446,6 +484,8 @@ class ReplyService:
             if state.closed:
                 return
             card_id = state.reply_card_id
+            if card_id is None:
+                return
             sequence = state.next_sequence
 
         self._feishu_adapter.disable_streaming_card(
@@ -466,6 +506,10 @@ class ReplyService:
         ).info("Closed Feishu streaming mode for reply card")
 
     async def _complete_current_card_for_followup(self, state: _ReplyStreamState) -> None:
+        async with state.lock:
+            has_reply_card = state.reply_card_id is not None
+        if not has_reply_card:
+            return
         async with state.lock:
             if state.closed:
                 return
@@ -510,7 +554,7 @@ class ReplyService:
             state.flush_task = None
             if flush_task is not None:
                 flush_task.cancel()
-            if fallback_text and not state.aggregated_text:
+            if fallback_text and not state.aggregated_text and state.reply_card_id is not None:
                 state.aggregated_text = fallback_text
             state.dirty = True
 
@@ -561,14 +605,15 @@ class ReplyService:
         async with state.lock:
             state.closed = True
 
-        self._reply_repository.update_reply(
-            bot_app_id=self._config.feishu.app_id,
-            reply_message_id=state.reply_message_id,
-            turn_id=state.turn_id,
-            agent_item_id=state.agent_item_id,
-            status=status,
-            reaction_applied=False,
-        )
+        if state.reply_message_id is not None:
+            self._reply_repository.update_reply(
+                bot_app_id=self._config.feishu.app_id,
+                reply_message_id=state.reply_message_id,
+                turn_id=state.turn_id,
+                agent_item_id=state.agent_item_id,
+                status=status,
+                reaction_applied=False,
+            )
         await self._session_executor.complete_turn(state.session_scope_key, state.turn_id)
         self._streams_by_turn.pop(state.turn_id, None)
         self._logger.bind(

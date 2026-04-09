@@ -17,8 +17,11 @@ from lark_oapi.api.cardkit.v1.model.content_card_element_request_body import (
 )
 from lark_oapi.api.cardkit.v1.model.create_card_request import CreateCardRequest
 from lark_oapi.api.cardkit.v1.model.create_card_request_body import CreateCardRequestBody
+from lark_oapi.api.cardkit.v1.model.card import Card
 from lark_oapi.api.cardkit.v1.model.settings_card_request import SettingsCardRequest
 from lark_oapi.api.cardkit.v1.model.settings_card_request_body import SettingsCardRequestBody
+from lark_oapi.api.cardkit.v1.model.update_card_request import UpdateCardRequest
+from lark_oapi.api.cardkit.v1.model.update_card_request_body import UpdateCardRequestBody
 from lark_oapi.api.im.v1.model.create_message_reaction_request import CreateMessageReactionRequest
 from lark_oapi.api.im.v1.model.create_message_reaction_request_body import (
     CreateMessageReactionRequestBody,
@@ -543,44 +546,98 @@ class FeishuAdapter:
         *,
         receive_id: str,
         card_payload: dict[str, object],
-    ) -> str:
-        return self._send_message(
+    ) -> FeishuReplyCardRef:
+        card_id = self.create_structured_card(card_payload=card_payload)
+        message_id = self._send_message(
             receive_id=receive_id,
             receive_id_type="chat_id",
             msg_type="interactive",
-            content=self._json_content(card_payload),
+            content=self._json_content(
+                {
+                    "type": "card",
+                    "data": {
+                        "card_id": card_id,
+                    },
+                }
+            ),
         )
+        return FeishuReplyCardRef(message_id=message_id, card_id=card_id)
 
-    def update_approval_message(self, *, message_id: str, card_payload: dict[str, object]) -> str:
+    def update_approval_message(
+        self,
+        *,
+        card_id: str,
+        card_payload: dict[str, object],
+        sequence: int,
+    ) -> str:
         start_time = time.perf_counter()
         try:
-            response = self._client.im.v1.message.update(
-                UpdateMessageRequest.builder()
-                .message_id(message_id)
+            response = self._client.cardkit.v1.card.update(
+                UpdateCardRequest.builder()
+                .card_id(card_id)
                 .request_body(
-                    UpdateMessageRequestBody.builder()
-                    .msg_type("interactive")
-                    .content(self._json_content(card_payload))
+                    UpdateCardRequestBody.builder()
+                    .card(
+                        Card.builder()
+                        .type("card_json")
+                        .data(self._json_content(card_payload))
+                        .build()
+                    )
+                    .uuid(uuid.uuid4().hex)
+                    .sequence(sequence)
                     .build()
                 )
                 .build()
             )
-            self._ensure_success(response, action="update_message", key=message_id)
-            updated_message_id = getattr(response.data, "message_id", None)
-            if not updated_message_id:
-                raise FeishuApiError("Feishu update_message succeeded but message_id is missing")
+            self._ensure_success(response, action="update_card", key=card_id)
             self._logger.bind(
                 event="feishu.approval_message.updated",
-                feishu_message_id=updated_message_id,
+                card_id=card_id,
+                sequence=sequence,
                 elapsed_ms=_elapsed_ms(start_time),
             ).info("Feishu approval message updated")
-            return updated_message_id
+            return card_id
         except Exception:
             self._logger.bind(
                 event="feishu.approval_message.update_failed",
-                feishu_message_id=message_id,
+                card_id=card_id,
+                sequence=sequence,
                 elapsed_ms=_elapsed_ms(start_time),
             ).exception("Failed to update Feishu approval message")
+            raise
+
+    def create_structured_card(self, *, card_payload: dict[str, object]) -> str:
+        start_time = time.perf_counter()
+        request_type = "card_json"
+        request_data = self._json_content(card_payload)
+        try:
+            response = self._client.cardkit.v1.card.create(
+                CreateCardRequest.builder()
+                .request_body(
+                    CreateCardRequestBody.builder()
+                    .type(request_type)
+                    .data(request_data)
+                    .build()
+                )
+                .build()
+            )
+            self._ensure_success(response, action="create_card", key=request_type)
+            card_id = getattr(response.data, "card_id", None)
+            if not card_id:
+                raise FeishuApiError("Feishu create_card succeeded but card_id is missing")
+            self._logger.bind(
+                event="feishu.card.created",
+                card_id=card_id,
+                request_type=request_type,
+                elapsed_ms=_elapsed_ms(start_time),
+            ).info("Created Feishu card")
+            return card_id
+        except Exception:
+            self._logger.bind(
+                event="feishu.card.create_failed",
+                request_type=request_type,
+                elapsed_ms=_elapsed_ms(start_time),
+            ).exception("Failed to create Feishu card")
             raise
 
     def send_user_input_message(
