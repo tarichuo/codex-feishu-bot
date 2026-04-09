@@ -444,6 +444,12 @@ class ApprovalService:
                     message_id=record.feishu_message_id,
                     card_payload=self.build_resolved_approval_card(record),
                 )
+                self._logger.bind(
+                    event="approval.prompt_updated",
+                    request_id=record.request_id,
+                    status=record.status,
+                    feishu_message_id=record.feishu_message_id,
+                ).info("Updated Feishu approval prompt after response")
                 return
             summary = "\n".join(
                 (

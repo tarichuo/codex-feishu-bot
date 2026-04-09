@@ -250,6 +250,19 @@ class ApplicationRuntime:
         self,
         action: CardActionCallback,
     ) -> CardActionCallbackResult:
+        action_value = action.action_value
+        self._logger.bind(
+            event="runtime.card_action.received",
+            request_id=action_value.get("request_id"),
+            open_message_id=action.open_message_id,
+            open_chat_id=action.open_chat_id,
+            operator_open_id=action.operator_open_id,
+            action_tag=action.action_tag,
+            action_name=action.action_name,
+            decision=action_value.get("decision"),
+            scope=action_value.get("scope"),
+        ).info("Received Feishu card action callback")
+
         sender_id = (
             action.operator_open_id
             or action.operator_user_id
@@ -268,7 +281,6 @@ class ApplicationRuntime:
                 toast_text="你不在允许操作该机器人的白名单中。",
             )
 
-        action_value = action.action_value
         if action_value.get("kind") != "approval":
             return CardActionCallbackResult(
                 toast_type="warning",
@@ -287,16 +299,12 @@ class ApplicationRuntime:
             return CardActionCallbackResult(
                 toast_type="warning",
                 toast_text=f"审批请求 {request_id} 不存在。",
-                card_payload=self._context.approval_service.build_card_action_not_found_card(
-                    request_id
-                ),
             )
 
         if record.status != "pending":
             return CardActionCallbackResult(
                 toast_type="info",
                 toast_text=f"审批请求 {request_id} 已处理。",
-                card_payload=self._context.approval_service.build_resolved_approval_card(record),
             )
 
         decision = action_value.get("decision") or "decline"
@@ -309,7 +317,6 @@ class ApplicationRuntime:
         return CardActionCallbackResult(
             toast_type="success",
             toast_text=f"审批请求 {updated.request_id} 已处理，状态: {updated.status}",
-            card_payload=self._context.approval_service.build_resolved_approval_card(updated),
         )
 
     async def _handle_codex_notification(self, notification: CodexNotification) -> None:

@@ -13,8 +13,13 @@ def _utc_from_millis(value: int | str | None) -> datetime:
         return datetime.now(tz=timezone.utc)
 
     raw = int(value)
-    # 飞书事件时间通常是毫秒时间戳，兼容部分场景直接传秒级时间戳。
-    if raw > 10_000_000_000:
+    # 飞书事件时间常见为秒级、毫秒级，卡片回调场景还可能出现微秒级或纳秒级时间戳。
+    # 这里按数量级兼容解析，避免把高精度时间戳误当成毫秒导致年份越界。
+    if raw >= 10_000_000_000_000_000:
+        return datetime.fromtimestamp(raw / 1_000_000_000, tz=timezone.utc)
+    if raw >= 10_000_000_000_000:
+        return datetime.fromtimestamp(raw / 1_000_000, tz=timezone.utc)
+    if raw >= 10_000_000_000:
         return datetime.fromtimestamp(raw / 1000, tz=timezone.utc)
     return datetime.fromtimestamp(raw, tz=timezone.utc)
 

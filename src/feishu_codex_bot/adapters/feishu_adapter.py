@@ -108,7 +108,7 @@ class FeishuAdapter:
             level=self._to_sdk_log_level(self._config.logging.level),
         )
         builder.register_p2_im_message_receive_v1(
-            lambda event: on_message(self.normalize_message_event(event))
+            lambda event: self._dispatch_message(event, on_message)
         )
         builder.register_p2_im_chat_member_bot_added_v1(
             lambda event: self._dispatch_bot_added(event, on_bot_added)
@@ -540,36 +540,139 @@ class FeishuAdapter:
         event: P2ImChatMemberBotAddedV1,
         handler: Callable[[BotAddedEvent], None] | None,
     ) -> None:
-        normalized = self.normalize_bot_added_event(event)
-        if handler is None:
+        header = getattr(event, "header", None)
+        payload = getattr(event, "event", None)
+        self._logger.bind(
+            event="feishu.bot_added.received",
+            feishu_event_id=getattr(header, "event_id", None),
+            feishu_event_type=getattr(header, "event_type", None),
+            chat_id=getattr(payload, "chat_id", None),
+            operator_open_id=getattr(getattr(payload, "operator_id", None), "open_id", None),
+        ).info("Received Feishu bot-added callback")
+        try:
+            normalized = self.normalize_bot_added_event(event)
+            if handler is None:
+                self._logger.bind(
+                    event="feishu.bot_added.unhandled",
+                    chat_id=normalized.chat_id,
+                    feishu_event_id=normalized.event_id,
+                ).info("Bot-added event received without handler")
+                return
             self._logger.bind(
-                event="feishu.bot_added.unhandled",
-                chat_id=normalized.chat_id,
+                event="feishu.bot_added.dispatch",
                 feishu_event_id=normalized.event_id,
-            ).info("Bot-added event received without handler")
-            return
-        handler(normalized)
+                chat_id=normalized.chat_id,
+            ).info("Dispatching Feishu bot-added callback")
+            handler(normalized)
+        except Exception:
+            self._logger.bind(
+                event="feishu.bot_added.dispatch_failed",
+                feishu_event_id=getattr(header, "event_id", None),
+                chat_id=getattr(payload, "chat_id", None),
+            ).exception("Failed to process Feishu bot-added callback")
+            raise
+
+    def _dispatch_message(
+        self,
+        event: P2ImMessageReceiveV1,
+        handler: Callable[[InboundMessage], None],
+    ) -> None:
+        header = getattr(event, "header", None)
+        payload = getattr(event, "event", None)
+        message = getattr(payload, "message", None)
+        sender = getattr(payload, "sender", None)
+        self._logger.bind(
+            event="feishu.message.received",
+            feishu_event_id=getattr(header, "event_id", None),
+            feishu_event_type=getattr(header, "event_type", None),
+            feishu_message_id=getattr(message, "message_id", None),
+            chat_id=getattr(message, "chat_id", None),
+            chat_type=getattr(message, "chat_type", None),
+            message_type=getattr(message, "message_type", None),
+            sender_open_id=getattr(getattr(sender, "sender_id", None), "open_id", None),
+        ).info("Received Feishu message callback")
+        try:
+            normalized = self.normalize_message_event(event)
+            self._logger.bind(
+                event="feishu.message.dispatch",
+                feishu_event_id=normalized.event_id,
+                feishu_message_id=normalized.message_id,
+                chat_id=normalized.chat_id,
+                chat_type=normalized.chat_type,
+            ).info("Dispatching Feishu message callback")
+            handler(normalized)
+        except Exception:
+            self._logger.bind(
+                event="feishu.message.dispatch_failed",
+                feishu_event_id=getattr(header, "event_id", None),
+                feishu_message_id=getattr(message, "message_id", None),
+                chat_id=getattr(message, "chat_id", None),
+            ).exception("Failed to process Feishu message callback")
+            raise
 
     def _dispatch_card_action(
         self,
         event: P2CardActionTrigger,
         handler: Callable[[CardActionCallback], CardActionCallbackResult] | None,
     ) -> P2CardActionTriggerResponse:
-        normalized = self.normalize_card_action_event(event)
-        if handler is None:
+        header = getattr(event, "header", None)
+        payload = getattr(event, "event", None)
+        action = getattr(payload, "action", None)
+        context = getattr(payload, "context", None)
+        operator = getattr(payload, "operator", None)
+        self._logger.bind(
+            event="feishu.card_action.received",
+            feishu_event_id=getattr(header, "event_id", None),
+            feishu_event_type=getattr(header, "event_type", None),
+            open_message_id=getattr(context, "open_message_id", None),
+            open_chat_id=getattr(context, "open_chat_id", None),
+            operator_open_id=getattr(operator, "open_id", None),
+            action_tag=getattr(action, "tag", None),
+            action_name=getattr(action, "name", None),
+            action_value=self._string_mapping(getattr(action, "value", None)),
+        ).info("Received Feishu card action callback")
+        try:
+            normalized = self.normalize_card_action_event(event)
+            if handler is None:
+                self._logger.bind(
+                    event="feishu.card_action.unhandled",
+                    feishu_event_id=normalized.event_id,
+                    open_message_id=normalized.open_message_id,
+                    operator_open_id=normalized.operator_open_id,
+                ).warning("Card action callback received without handler")
+                return self._build_card_action_response(
+                    CardActionCallbackResult(
+                        toast_type="warning",
+                        toast_text="暂不支持此卡片交互。",
+                    )
+                )
             self._logger.bind(
-                event="feishu.card_action.unhandled",
+                event="feishu.card_action.dispatch",
                 feishu_event_id=normalized.event_id,
                 open_message_id=normalized.open_message_id,
                 operator_open_id=normalized.operator_open_id,
-            ).warning("Card action callback received without handler")
-            return self._build_card_action_response(
-                CardActionCallbackResult(
-                    toast_type="warning",
-                    toast_text="暂不支持此卡片交互。",
-                )
-            )
-        return self._build_card_action_response(handler(normalized))
+                action_tag=normalized.action_tag,
+                action_name=normalized.action_name,
+            ).info("Dispatching Feishu card action callback")
+            result = handler(normalized)
+            self._logger.bind(
+                event="feishu.card_action.dispatched",
+                feishu_event_id=normalized.event_id,
+                open_message_id=normalized.open_message_id,
+                toast_type=result.toast_type,
+                has_card_payload=result.card_payload is not None,
+            ).info("Feishu card action callback handled")
+            return self._build_card_action_response(result)
+        except Exception:
+            self._logger.bind(
+                event="feishu.card_action.dispatch_failed",
+                feishu_event_id=getattr(header, "event_id", None),
+                open_message_id=getattr(context, "open_message_id", None),
+                operator_open_id=getattr(operator, "open_id", None),
+                action_tag=getattr(action, "tag", None),
+                action_name=getattr(action, "name", None),
+            ).exception("Failed to process Feishu card action callback")
+            raise
 
     def _send_message(
         self,
