@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "feishu-codex-bot"
-version = "0.1.0"
+version = "0.1.1"
 description = "A Feishu bot server that bridges conversations to a local Codex app server."
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [
   { name = "codex-feishu-bot contributors" }
@@ -14,9 +14,13 @@ authors = [
 keywords = ["feishu", "codex", "json-rpc", "bot"]
 classifiers = [
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.10",
   "License :: OSI Approved :: Apache Software License",
   "Operating System :: OS Independent"
+]
+dependencies = [
+  "lark-oapi>=1.4,<2.0",
+  "websockets>=16,<17",
 ]
 
 [project.scripts]

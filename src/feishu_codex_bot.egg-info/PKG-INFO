@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: feishu-codex-bot
+Version: 0.1.1
+Summary: A Feishu bot server that bridges conversations to a local Codex app server.
+Author: codex-feishu-bot contributors
+License: Apache-2.0
+Keywords: feishu,codex,json-rpc,bot
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.10
+License-File: LICENSE
+Requires-Dist: lark-oapi<2.0,>=1.4
+Requires-Dist: websockets<17,>=16
+Dynamic: license-file

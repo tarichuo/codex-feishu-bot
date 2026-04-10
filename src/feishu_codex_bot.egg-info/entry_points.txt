@@ -1,0 +1,2 @@
+[console_scripts]
+feishu-codex-bot = feishu_codex_bot.app:main
