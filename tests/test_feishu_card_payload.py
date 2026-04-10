@@ -52,6 +52,7 @@ for module_name, class_names in {
     sys.modules.setdefault(module_name, module)
 
 from feishu_codex_bot.adapters.feishu_adapter import FeishuAdapter
+from feishu_codex_bot.models.inbound import ImageContent, TextContent
 
 
 def test_streaming_card_status_uses_markdown_icon_structure() -> None:
@@ -71,3 +72,36 @@ def test_streaming_card_status_uses_markdown_icon_structure() -> None:
         "color": "grey-500",
     }
     assert "<i token=" not in status_element["content"]
+
+
+def test_extract_post_parts_supports_top_level_post_content_with_images() -> None:
+    adapter = FeishuAdapter.__new__(FeishuAdapter)
+
+    parts = adapter._extract_post_parts(
+        {
+            "title": "",
+            "content": [
+                [
+                    {
+                        "tag": "img",
+                        "image_key": "img_v3_0210j_3fce369d-0f94-47f5-8e54-3716922614bg",
+                        "width": 779,
+                        "height": 766,
+                    }
+                ],
+                [
+                    {
+                        "tag": "text",
+                        "text": "这段代码有什么问题",
+                        "style": [],
+                    }
+                ],
+            ],
+        }
+    )
+
+    assert len(parts) == 2
+    assert isinstance(parts[0], ImageContent)
+    assert parts[0].image_key == "img_v3_0210j_3fce369d-0f94-47f5-8e54-3716922614bg"
+    assert isinstance(parts[1], TextContent)
+    assert parts[1].text.strip() == "这段代码有什么问题"

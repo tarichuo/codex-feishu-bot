@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+import json
 import mimetypes
 from pathlib import Path
 import re
@@ -15,6 +16,8 @@ from lark_oapi.api.im.v1.model.create_image_request import CreateImageRequest
 from lark_oapi.api.im.v1.model.create_image_request_body import CreateImageRequestBody
 from lark_oapi.api.im.v1.model.get_file_request import GetFileRequest
 from lark_oapi.api.im.v1.model.get_image_request import GetImageRequest
+from lark_oapi.api.im.v1.model.get_message_request import GetMessageRequest
+from lark_oapi.api.im.v1.model.get_message_resource_request import GetMessageResourceRequest
 from lark_oapi.core.model import BaseResponse
 
 from feishu_codex_bot.logging import ContextLoggerAdapter, get_logger
@@ -70,10 +73,43 @@ class MediaService:
         *,
         source_message_id: str | None = None,
     ) -> DownloadedMedia:
-        response = self._client.im.v1.image.get(
-            GetImageRequest.builder().image_key(image_key).build()
-        )
-        self._ensure_success(response, action="download_image", key=image_key)
+        if source_message_id:
+            file_key = self._resolve_image_file_key(
+                source_message_id=source_message_id,
+                image_key=image_key,
+            )
+            response = self._client.im.v1.message_resource.get(
+                GetMessageResourceRequest.builder()
+                .message_id(source_message_id)
+                .file_key(file_key)
+                .type("image")
+                .build()
+            )
+            self._ensure_success(
+                response,
+                action="download_image",
+                key=f"{source_message_id}:{file_key}",
+            )
+            self._logger.bind(
+                event="feishu.media.download.request",
+                media_type="image",
+                source_message_id=source_message_id,
+                image_key=image_key,
+                file_key=file_key,
+                api="message_resource.get",
+            ).info("Downloading Feishu image via message resource API")
+        else:
+            response = self._client.im.v1.image.get(
+                GetImageRequest.builder().image_key(image_key).build()
+            )
+            self._ensure_success(response, action="download_image", key=image_key)
+            self._logger.bind(
+                event="feishu.media.download.request",
+                media_type="image",
+                source_message_id=None,
+                image_key=image_key,
+                api="image.get",
+            ).info("Downloading Feishu image via legacy image API")
         return self._persist_download(
             media_type="image",
             source_key=image_key,
@@ -203,6 +239,79 @@ class MediaService:
             sha256=media.sha256,
         ).info("Feishu media downloaded")
         return media
+
+    def _resolve_image_file_key(
+        self,
+        *,
+        source_message_id: str,
+        image_key: str,
+    ) -> str:
+        response = self._client.im.v1.message.get(
+            GetMessageRequest.builder().message_id(source_message_id).build()
+        )
+        self._ensure_success(response, action="get_message", key=source_message_id)
+        items = getattr(getattr(response, "data", None), "items", None) or []
+        if not items:
+            raise MediaServiceError(
+                f"Feishu get_message returned no items for message {source_message_id}"
+            )
+        body = getattr(items[0], "body", None)
+        raw_content = getattr(body, "content", None)
+        content = self._parse_message_content(raw_content)
+        file_key = self._find_image_file_key(content=content, image_key=image_key)
+        if not file_key:
+            self._logger.bind(
+                event="feishu.media.file_key.fallback",
+                source_message_id=source_message_id,
+                image_key=image_key,
+                fallback_file_key=image_key,
+            ).warning("Feishu message content did not expose file_key, falling back to image_key")
+            return image_key
+        self._logger.bind(
+            event="feishu.media.file_key.resolved",
+            source_message_id=source_message_id,
+            image_key=image_key,
+            file_key=file_key,
+        ).info("Resolved Feishu image file_key from message content")
+        return file_key
+
+    def _parse_message_content(self, raw_content: str | None) -> object:
+        if not raw_content:
+            return {}
+        try:
+            return json.loads(raw_content)
+        except json.JSONDecodeError as exc:
+            raise MediaServiceError("Feishu message content is not valid JSON") from exc
+
+    def _find_image_file_key(self, *, content: object, image_key: str) -> str | None:
+        matched_fallback: str | None = None
+
+        def walk(node: object) -> str | None:
+            nonlocal matched_fallback
+            if isinstance(node, dict):
+                tag = node.get("tag")
+                node_image_key = node.get("image_key")
+                node_file_key = node.get("file_key")
+                if tag in {"img", "image"} or node_image_key or node_file_key:
+                    normalized_file_key = str(node_file_key) if isinstance(node_file_key, str) else None
+                    normalized_image_key = str(node_image_key) if isinstance(node_image_key, str) else None
+                    if normalized_image_key == image_key and normalized_file_key:
+                        return normalized_file_key
+                    if normalized_file_key and matched_fallback is None:
+                        matched_fallback = normalized_file_key
+                for value in node.values():
+                    found = walk(value)
+                    if found:
+                        return found
+                return None
+            if isinstance(node, list):
+                for item in node:
+                    found = walk(item)
+                    if found:
+                        return found
+            return None
+
+        return walk(content) or matched_fallback
 
     def _ensure_success(self, response: BaseResponse, *, action: str, key: str) -> None:
         if response.success():

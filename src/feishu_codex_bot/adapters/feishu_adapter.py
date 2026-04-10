@@ -1068,10 +1068,15 @@ class FeishuAdapter:
     def _select_post_locale(self, payload: object) -> dict[str, object]:
         if not isinstance(payload, dict):
             return {}
+        if isinstance(payload.get("content"), list):
+            return payload
         for locale_key in ("zh_cn", "en_us"):
             locale_block = payload.get(locale_key)
             if isinstance(locale_block, dict):
                 return locale_block
+        for value in payload.values():
+            if isinstance(value, dict) and isinstance(value.get("content"), list):
+                return value
         for value in payload.values():
             if isinstance(value, dict):
                 return value
