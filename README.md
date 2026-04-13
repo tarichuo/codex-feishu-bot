@@ -14,7 +14,7 @@
 
 ## 前置条件
 ### CODEX
-1. 需要在本地配置好codex的cli环境，能正常工作。当前适配版本为codex-cli 0.116.0
+1. 需要在本地配置好codex的cli环境，能正常工作。当前适配版本为codex-cli 0.120.0
 
 ### 飞书机器人
 1. 飞书开放平台上创建自己的机器人应用：https://open.feishu.cn/app
@@ -25,7 +25,7 @@
 
 ## 服务启动
 ### 启动codex
-1. 启动codex app-server：`codex app-server --listen ws://127.0.0.1:9000 --session-source feishu-bot`
+1. 启动codex app-server：`codex app-server --listen ws://127.0.0.1:9000`
 
 ### 启动codex-feishu-bot
 #### 依赖的环境变量(参考env.example)
