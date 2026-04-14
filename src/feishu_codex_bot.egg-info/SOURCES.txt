@@ -28,13 +28,17 @@ src/feishu_codex_bot/persistence/reply_repo.py
 src/feishu_codex_bot/persistence/security_repo.py
 src/feishu_codex_bot/persistence/session_repo.py
 src/feishu_codex_bot/services/approval_service.py
+src/feishu_codex_bot/services/codex_dump_service.py
 src/feishu_codex_bot/services/conversation_service.py
 src/feishu_codex_bot/services/media_service.py
 src/feishu_codex_bot/services/reply_service.py
 src/feishu_codex_bot/services/security_service.py
 src/feishu_codex_bot/workers/session_executor.py
+tests/test_app.py
 tests/test_approval_service.py
 tests/test_cli.py
+tests/test_codex_dump_service.py
+tests/test_codex_output_classifier.py
 tests/test_conversation_service.py
 tests/test_feishu_card_payload.py
 tests/test_inbound_models.py

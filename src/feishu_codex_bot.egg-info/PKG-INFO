@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: feishu-codex-bot
-Version: 0.1.1
+Version: 0.2.0
 Summary: A Feishu bot server that bridges conversations to a local Codex app server.
 Author: codex-feishu-bot contributors
 License: Apache-2.0
