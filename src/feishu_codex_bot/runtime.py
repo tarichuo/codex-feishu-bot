@@ -755,16 +755,16 @@ class ApplicationRuntime:
         ).warning("Blocked unauthorized card action and sent owner alert")
 
 
-async def run_application() -> None:
+async def run_application(*, enable_dump: bool = False) -> None:
     """Bootstrap and run the full application runtime."""
-    runtime = ApplicationRuntime(bootstrap_runtime())
+    runtime = ApplicationRuntime(bootstrap_runtime(enable_dump=enable_dump))
     await runtime.run()
 
 
-def run_application_sync() -> int:
+def run_application_sync(*, enable_dump: bool = False) -> int:
     """Run the application from a synchronous entrypoint."""
     try:
-        asyncio.run(run_application())
+        asyncio.run(run_application(enable_dump=enable_dump))
     except ConfigError:
         raise
     except KeyboardInterrupt:

@@ -20,6 +20,7 @@ from feishu_codex_bot.persistence.security_repo import SecurityAlertRepository
 from feishu_codex_bot.persistence.session_repo import SessionRepository
 from feishu_codex_bot.services.approval_service import ApprovalService
 from feishu_codex_bot.services.conversation_service import ConversationService
+from feishu_codex_bot.services.codex_dump_service import CodexDumpService
 from feishu_codex_bot.services.media_service import MediaService
 from feishu_codex_bot.services.reply_service import ReplyService
 from feishu_codex_bot.services.security_service import SecurityService
@@ -55,6 +56,7 @@ class RuntimeContext:
     conversation_service: ConversationService
     reply_service: ReplyService
     approval_service: ApprovalService
+    codex_dump_service: CodexDumpService | None = None
 
 
 def bootstrap(
@@ -88,6 +90,7 @@ def bootstrap_runtime(
     env: Mapping[str, str] | None = None,
     *,
     base_dir: Path | None = None,
+    enable_dump: bool = False,
 ) -> RuntimeContext:
     """Create all runtime dependencies needed to run the application."""
     bootstrap_context = bootstrap(env, base_dir=base_dir)
@@ -111,8 +114,17 @@ def bootstrap_runtime(
         config,
         logger=root_logger.bind(component="feishu_adapter"),
     )
+    codex_dump_service: CodexDumpService | None = None
+    if enable_dump:
+        codex_dump_service = CodexDumpService(config.storage.data_dir / "dump.json")
+        codex_dump_service.reset()
+        root_logger.bind(
+            event="bootstrap.codex_dump.enabled",
+            dump_path=codex_dump_service.dump_path,
+        ).info("Enabled Codex callback dump")
     codex_client = CodexClient(
         config,
+        dump_service=codex_dump_service,
         logger=root_logger.bind(component="codex_client"),
     )
     media_service = MediaService(
@@ -176,4 +188,5 @@ def bootstrap_runtime(
         conversation_service=conversation_service,
         reply_service=reply_service,
         approval_service=approval_service,
+        codex_dump_service=codex_dump_service,
     )

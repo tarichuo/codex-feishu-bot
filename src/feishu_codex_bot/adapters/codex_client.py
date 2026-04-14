@@ -27,6 +27,7 @@ from feishu_codex_bot.models.actions import (
     ThreadStartOptions,
     TurnStartOptions,
 )
+from feishu_codex_bot.services.codex_dump_service import CodexDumpService
 
 
 NotificationHandler = Callable[[CodexNotification], Awaitable[None] | None]
@@ -64,10 +65,12 @@ class CodexClient:
         self,
         config: AppConfig,
         *,
+        dump_service: CodexDumpService | None = None,
         logger: ContextLoggerAdapter | None = None,
     ) -> None:
         self._server_url = config.codex.server_url
         self._logger = logger or get_logger(__name__, codex_server_url=self._server_url)
+        self._dump_service = dump_service
         self._websocket: Any | None = None
         self._receiver_task: asyncio.Task[None] | None = None
         self._connect_lock = asyncio.Lock()
@@ -314,6 +317,8 @@ class CodexClient:
         method = payload.get("method")
         if not isinstance(method, str):
             raise CodexClientError("Codex notification missing method")
+        if self._dump_service is not None:
+            self._dump_service.record_notification(payload)
 
         notification = CodexNotification.from_payload(method, payload.get("params"))
         self._logger.bind(
@@ -339,6 +344,8 @@ class CodexClient:
         request_id = payload.get("id")
         if not isinstance(method, str) or not isinstance(request_id, (str, int)):
             raise CodexClientError("Codex server request missing method or id")
+        if self._dump_service is not None:
+            self._dump_service.record_server_request(payload)
 
         request = CodexServerRequest.from_payload(request_id, method, payload.get("params"))
         self._logger.bind(
