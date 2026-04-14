@@ -12,6 +12,7 @@ from feishu_codex_bot.adapters.feishu_adapter import FeishuAdapter
 from feishu_codex_bot.config import AppConfig
 from feishu_codex_bot.logging import ContextLoggerAdapter, get_logger
 from feishu_codex_bot.models.actions import (
+    CodexCommandEvent,
     CodexNotification,
     CodexOutputEvent,
     CodexTextDeltaEvent,
@@ -36,6 +37,13 @@ def _elapsed_ms(start_time: float) -> int:
 
 
 @dataclass(slots=True)
+class _ReplyDisplayBlock:
+    kind: Literal["command", "text"]
+    text: str
+    item_id: str | None = None
+
+
+@dataclass(slots=True)
 class _ReplyStreamState:
     session_scope_key: str
     source_message_id: str
@@ -49,6 +57,12 @@ class _ReplyStreamState:
     last_sent_text: str
     next_sequence: int
     aggregated_text: str = ""
+    rendered_agent_text_length: int = 0
+    active_agent_message_item_id: str | None = None
+    display_blocks: list[_ReplyDisplayBlock] = field(default_factory=list)
+    active_text_block_index: int | None = None
+    command_segment_open: bool = False
+    seen_command_item_ids: set[str] = field(default_factory=set)
     latest_error_text: str | None = None
     agent_item_id: str | None = None
     status: ReplyStreamStatus = "streaming"
@@ -230,6 +244,12 @@ class ReplyService:
             state.last_sent_text = ""
             state.next_sequence = 0
             state.aggregated_text = ""
+            state.rendered_agent_text_length = 0
+            state.active_agent_message_item_id = None
+            state.display_blocks = []
+            state.active_text_block_index = None
+            state.command_segment_open = False
+            state.seen_command_item_ids = set()
             state.latest_error_text = None
             state.agent_item_id = None
             state.status = "streaming"
@@ -277,6 +297,16 @@ class ReplyService:
             if event.channel != "agentMessage":
                 return False
             await self._replace_text(state, event.text, item_id=event.item_id)
+            return True
+
+        if isinstance(event, CodexCommandEvent):
+            if not event.display_commands:
+                return False
+            await self._append_command_notice(
+                state,
+                commands=event.display_commands,
+                item_id=event.item_id,
+            )
             return True
 
         if isinstance(event, CodexTurnErrorEvent):
@@ -333,10 +363,12 @@ class ReplyService:
         async with state.lock:
             if state.closed:
                 return
+            self._ensure_agent_message_context(state, item_id=item_id)
             state.aggregated_text += text
+            text_changed = self._append_unrendered_agent_text(state)
             if item_id is not None:
                 state.agent_item_id = item_id
-            state.dirty = True
+            state.dirty = text_changed or state.dirty
             should_flush_immediately = (
                 state.flush_task is None and not state.flushing and self._flush_is_due(state)
             )
@@ -367,11 +399,42 @@ class ReplyService:
         async with state.lock:
             if state.closed:
                 return
-            if text and (not state.aggregated_text or len(text) >= len(state.aggregated_text)):
-                state.aggregated_text = text
-                state.dirty = True
+            text_changed = False
+            if text:
+                self._ensure_agent_message_context(state, item_id=item_id)
+                text_changed = self._replace_agent_text(state, text)
             if item_id is not None:
                 state.agent_item_id = item_id
+            state.dirty = text_changed or state.dirty
+            should_flush_immediately = (
+                state.flush_task is None and not state.flushing and self._flush_is_due(state)
+            )
+            if not should_flush_immediately and state.flush_task is None and not state.flushing:
+                state.flush_task = asyncio.create_task(self._flush_after_delay(state.turn_id))
+
+        if should_flush_immediately:
+            await self._flush_state(state, force=False)
+
+    async def _append_command_notice(
+        self,
+        state: _ReplyStreamState,
+        *,
+        commands: tuple[str, ...],
+        item_id: str | None,
+    ) -> None:
+        normalized_commands = tuple(command.strip() for command in commands if command.strip())
+        if not normalized_commands:
+            return
+
+        async with state.lock:
+            if state.closed:
+                return
+            if item_id is not None and item_id in state.seen_command_item_ids:
+                return
+            if item_id is not None:
+                state.seen_command_item_ids.add(item_id)
+            self._append_command_block(state, normalized_commands)
+            state.dirty = True
             should_flush_immediately = (
                 state.flush_task is None and not state.flushing and self._flush_is_due(state)
             )
@@ -409,11 +472,14 @@ class ReplyService:
             state.flush_task = None
             if state.closed or state.flushing:
                 return
+            target_text = self._compose_reply_text(
+                display_blocks=state.display_blocks,
+                placeholder_text=state.placeholder_text,
+            )
             if state.reply_card_id is None:
-                if not state.aggregated_text:
+                if not target_text or target_text == state.placeholder_text:
                     return
                 create_reply_card = True
-                target_text = state.aggregated_text or state.placeholder_text
                 status = state.status
                 source_message_id = state.source_message_id
                 reply_in_thread = state.reply_in_thread
@@ -421,7 +487,6 @@ class ReplyService:
                 agent_item_id = state.agent_item_id
                 state.flushing = True
             else:
-                target_text = state.aggregated_text or state.placeholder_text
                 if not force and (not state.dirty or target_text == state.last_sent_text):
                     return
                 sequence = state.next_sequence
@@ -452,7 +517,10 @@ class ReplyService:
                         state.reply_card_id = reply_card.card_id
                         state.last_sent_text = target_text
                         state.next_sequence = 2
-                        state.dirty = state.aggregated_text != target_text
+                        state.dirty = self._compose_reply_text(
+                            display_blocks=state.display_blocks,
+                            placeholder_text=state.placeholder_text,
+                        ) != target_text
                 self._logger.bind(
                     event="reply.turn.reply_card_created",
                     session_scope_key=state.session_scope_key,
@@ -543,6 +611,122 @@ class ReplyService:
 
         return "\n\n".join(sections)
 
+    def _compose_reply_text(
+        self,
+        *,
+        display_blocks: list[_ReplyDisplayBlock],
+        placeholder_text: str,
+    ) -> str:
+        normalized_blocks = [block.text.strip() for block in display_blocks if block.text.strip()]
+        if normalized_blocks:
+            return "\n\n".join(normalized_blocks)
+        return placeholder_text
+
+    def _ensure_agent_message_context(
+        self,
+        state: _ReplyStreamState,
+        *,
+        item_id: str | None,
+    ) -> None:
+        if item_id is None or item_id == state.active_agent_message_item_id:
+            return
+        state.active_agent_message_item_id = item_id
+        state.aggregated_text = ""
+        state.rendered_agent_text_length = 0
+        state.active_text_block_index = None
+        state.command_segment_open = False
+
+    def _replace_agent_text(self, state: _ReplyStreamState, text: str) -> bool:
+        if text == state.aggregated_text and state.rendered_agent_text_length >= len(text):
+            return False
+        previous_rendered_text = state.aggregated_text[: state.rendered_agent_text_length]
+        if text.startswith(previous_rendered_text):
+            state.aggregated_text = text
+            return self._append_unrendered_agent_text(state)
+        if state.aggregated_text.startswith(text):
+            return False
+
+        state.aggregated_text = text
+        state.rendered_agent_text_length = 0
+        state.display_blocks = [
+            block
+            for block in state.display_blocks
+            if block.kind != "text" or block.item_id != state.active_agent_message_item_id
+        ]
+        state.active_text_block_index = None
+        state.command_segment_open = False
+        return self._append_unrendered_agent_text(state)
+
+    def _append_unrendered_agent_text(self, state: _ReplyStreamState) -> bool:
+        if state.rendered_agent_text_length > len(state.aggregated_text):
+            state.rendered_agent_text_length = 0
+        text_fragment = state.aggregated_text[state.rendered_agent_text_length :]
+        if not text_fragment:
+            return False
+        self._append_text_fragment(state, text_fragment)
+        state.rendered_agent_text_length = len(state.aggregated_text)
+        return True
+
+    def _append_text_fragment(self, state: _ReplyStreamState, text_fragment: str) -> None:
+        if not text_fragment.strip():
+            return
+        state.command_segment_open = False
+        if (
+            state.active_text_block_index is None
+            or state.active_text_block_index >= len(state.display_blocks)
+            or state.display_blocks[state.active_text_block_index].kind != "text"
+            or state.active_text_block_index != len(state.display_blocks) - 1
+        ):
+            state.display_blocks.append(
+                _ReplyDisplayBlock(
+                    kind="text",
+                    text=text_fragment,
+                    item_id=state.active_agent_message_item_id,
+                )
+            )
+            state.active_text_block_index = len(state.display_blocks) - 1
+            return
+        state.display_blocks[state.active_text_block_index].text += text_fragment
+
+    def _append_command_block(
+        self,
+        state: _ReplyStreamState,
+        commands: tuple[str, ...],
+    ) -> None:
+        command_lines = self._format_command_lines(commands)
+        if not command_lines:
+            return
+        if (
+            state.command_segment_open
+            and state.display_blocks
+            and state.display_blocks[-1].kind == "command"
+        ):
+            existing_text = state.display_blocks[-1].text.rstrip()
+            state.display_blocks[-1].text = "\n".join([existing_text, *command_lines])
+            return
+        state.display_blocks.append(
+            _ReplyDisplayBlock(
+                kind="command",
+                text="\n".join(
+                    [
+                        "<font color='grey-500'>正在执行命令：</font>",
+                        *command_lines,
+                    ]
+                ),
+            )
+        )
+        state.command_segment_open = True
+
+    def _format_command_lines(self, commands: tuple[str, ...]) -> list[str]:
+        quoted_commands: list[str] = []
+        for command in commands:
+            lines = command.splitlines() or [command]
+            for line in lines:
+                stripped_line = line.strip()
+                if stripped_line:
+                    quoted_commands.append(f"> <font color='grey-500'>{stripped_line}</font>")
+        return quoted_commands
+
     async def _close_streaming_card(self, state: _ReplyStreamState) -> None:
         async with state.lock:
             if state.closed:
@@ -620,8 +804,14 @@ class ReplyService:
             if flush_task is not None:
                 flush_task.cancel()
             effective_fallback_text = fallback_text or state.latest_error_text or self._failure_text
-            if effective_fallback_text and not state.aggregated_text and state.reply_card_id is not None:
+            if (
+                status == "failed"
+                and effective_fallback_text
+                and not state.aggregated_text
+                and state.reply_card_id is not None
+            ):
                 state.aggregated_text = effective_fallback_text
+                self._append_unrendered_agent_text(state)
             state.dirty = True
 
         if flush_task is not None:
@@ -750,5 +940,10 @@ class ReplyService:
             thread_id=state.thread_id,
             turn_id=state.turn_id,
             status=status,
-            text_length=len(state.aggregated_text or state.placeholder_text),
+            text_length=len(
+                self._compose_reply_text(
+                    display_blocks=state.display_blocks,
+                    placeholder_text=state.placeholder_text,
+                )
+            ),
         ).info("Finalized reply stream")

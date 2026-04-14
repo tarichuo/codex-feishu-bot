@@ -111,6 +111,7 @@ class CodexOutputClassifier:
                     thread_id=notification.thread_id,
                     turn_id=notification.turn_id,
                     item_id=notification.item_id,
+                    display_commands=(),
                     delta=delta if isinstance(delta, str) else None,
                 ),
             )
@@ -173,6 +174,11 @@ class CodexOutputClassifier:
             item = notification.params.get("item")
             if isinstance(item, dict):
                 return self._classify_completed_item(notification, item)
+
+        if notification.method == "item/started":
+            item = notification.params.get("item")
+            if isinstance(item, dict):
+                return self._classify_started_item(notification, item)
 
         return (
             CodexUnknownEvent(
@@ -244,6 +250,7 @@ class CodexOutputClassifier:
                     thread_id=notification.thread_id,
                     turn_id=notification.turn_id,
                     item_id=item_id,
+                    display_commands=(),
                     aggregated_output=item.get("aggregatedOutput")
                     if isinstance(item.get("aggregatedOutput"), str)
                     else None,
@@ -351,3 +358,56 @@ class CodexOutputClassifier:
                 payload=item,
             ),
         )
+
+    def _classify_started_item(
+        self,
+        notification: CodexNotification,
+        item: dict[str, object],
+    ) -> tuple[CodexOutputEvent, ...]:
+        item_type = item.get("type")
+        item_id = item.get("id") if isinstance(item.get("id"), str) else notification.item_id
+
+        if item_type == "commandExecution":
+            command = item.get("command") if isinstance(item.get("command"), str) else None
+            return (
+                CodexCommandEvent(
+                    command=command,
+                    cwd=item.get("cwd") if isinstance(item.get("cwd"), str) else None,
+                    status=item.get("status") if isinstance(item.get("status"), str) else None,
+                    thread_id=notification.thread_id,
+                    turn_id=notification.turn_id,
+                    item_id=item_id,
+                    display_commands=self._extract_display_commands(item, fallback_command=command),
+                ),
+            )
+
+        return (
+            CodexUnknownEvent(
+                source=f"item/started:{item_type}",
+                thread_id=notification.thread_id,
+                turn_id=notification.turn_id,
+                item_id=item_id,
+                payload=item,
+            ),
+        )
+
+    def _extract_display_commands(
+        self,
+        item: dict[str, object],
+        *,
+        fallback_command: str | None,
+    ) -> tuple[str, ...]:
+        command_actions = item.get("commandActions")
+        commands: list[str] = []
+        if isinstance(command_actions, list):
+            for action in command_actions:
+                if not isinstance(action, dict):
+                    continue
+                command = action.get("command")
+                if isinstance(command, str) and command:
+                    commands.append(command)
+        if commands:
+            return tuple(commands)
+        if fallback_command:
+            return (fallback_command,)
+        return ()

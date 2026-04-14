@@ -407,6 +407,7 @@ class CodexCommandEvent:
     thread_id: str | None
     turn_id: str | None
     item_id: str | None
+    display_commands: tuple[str, ...] = ()
     aggregated_output: str | None = None
     exit_code: int | None = None
     delta: str | None = None

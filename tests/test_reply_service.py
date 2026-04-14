@@ -17,8 +17,10 @@ from feishu_codex_bot.config import (
     StorageConfig,
 )
 from feishu_codex_bot.models.actions import (
+    CodexCommandEvent,
     CodexNotification,
     CodexTextDeltaEvent,
+    CodexTextMessageEvent,
     CodexTurnErrorEvent,
     CodexTurnLifecycleEvent,
 )
@@ -309,6 +311,586 @@ def test_reply_service_uses_streaming_card_updates(tmp_path: Path) -> None:
     assert reply_repository.records["reply-message-1"].reaction_applied is False
     assert session_executor.activated == [("p2p:ou_owner", "turn-1")]
     assert session_executor.completed == [("p2p:ou_owner", "turn-1")]
+
+
+def test_reply_service_prepends_command_notice_before_final_message(tmp_path: Path) -> None:
+    feishu_adapter = _FakeFeishuAdapter()
+    reply_repository = _FakeReplyRepository()
+    session_executor = _FakeSessionExecutor()
+    classifier = _FakeClassifier(
+        CodexCommandEvent(
+            command='rg -n "foo" src',
+            cwd="/workspace",
+            status="in_progress",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="cmd-1",
+            display_commands=('rg -n "foo" src',),
+        ),
+        CodexTextMessageEvent(
+            channel="agentMessage",
+            text="最终回答",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="msg-1",
+        ),
+        CodexTurnLifecycleEvent(
+            phase="completed",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            status="completed",
+            error=None,
+        ),
+    )
+    service = ReplyService(
+        _build_config(tmp_path),
+        feishu_adapter=feishu_adapter,
+        reply_repository=reply_repository,
+        session_executor=session_executor,
+        classifier=classifier,
+    )
+
+    async def _run() -> None:
+        await service.start_turn(
+            session_scope_key="p2p:ou_owner",
+            source_message_id="om_source",
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
+        await service.handle_notification(
+            CodexNotification(
+                method="test.notification",
+                params={},
+                thread_id="thread-1",
+                turn_id="turn-1",
+                item_id=None,
+                request_id=None,
+            )
+        )
+
+    asyncio.run(_run())
+
+    expected_notice = (
+        "<font color='grey-500'>正在执行命令：</font>\n"
+        "> <font color='grey-500'>rg -n \"foo\" src</font>"
+    )
+    assert feishu_adapter.reply_cards == [
+        {
+            "message_id": "om_source",
+            "text": expected_notice,
+            "reply_in_thread": False,
+            "status": "streaming",
+        }
+    ]
+    assert feishu_adapter.card_updates == [
+        {
+            "card_id": "card-1",
+            "text": f"{expected_notice}\n\n最终回答",
+            "status": "completed",
+            "sequence": 2,
+        },
+    ]
+
+
+def test_reply_service_deduplicates_command_notice_by_item_id(tmp_path: Path) -> None:
+    feishu_adapter = _FakeFeishuAdapter()
+    reply_repository = _FakeReplyRepository()
+    session_executor = _FakeSessionExecutor()
+    classifier = _FakeClassifier(
+        CodexCommandEvent(
+            command="pwd",
+            cwd="/workspace",
+            status="in_progress",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="cmd-1",
+            display_commands=("pwd",),
+        ),
+        CodexCommandEvent(
+            command="pwd",
+            cwd="/workspace",
+            status="in_progress",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="cmd-1",
+            display_commands=("pwd",),
+        ),
+        CodexTurnLifecycleEvent(
+            phase="completed",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            status="completed",
+            error=None,
+        ),
+    )
+    service = ReplyService(
+        _build_config(tmp_path),
+        feishu_adapter=feishu_adapter,
+        reply_repository=reply_repository,
+        session_executor=session_executor,
+        classifier=classifier,
+    )
+
+    async def _run() -> None:
+        await service.start_turn(
+            session_scope_key="p2p:ou_owner",
+            source_message_id="om_source",
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
+        await service.handle_notification(
+            CodexNotification(
+                method="test.notification",
+                params={},
+                thread_id="thread-1",
+                turn_id="turn-1",
+                item_id=None,
+                request_id=None,
+            )
+        )
+
+    asyncio.run(_run())
+
+    expected_notice = "<font color='grey-500'>正在执行命令：</font>\n> <font color='grey-500'>pwd</font>"
+    assert feishu_adapter.reply_cards == [
+        {
+            "message_id": "om_source",
+            "text": expected_notice,
+            "reply_in_thread": False,
+            "status": "streaming",
+        }
+    ]
+    assert feishu_adapter.card_updates == [
+        {
+            "card_id": "card-1",
+            "text": expected_notice,
+            "status": "completed",
+            "sequence": 2,
+        },
+    ]
+
+
+def test_reply_service_merges_consecutive_command_notices_under_one_header(tmp_path: Path) -> None:
+    feishu_adapter = _FakeFeishuAdapter()
+    reply_repository = _FakeReplyRepository()
+    session_executor = _FakeSessionExecutor()
+    classifier = _FakeClassifier(
+        CodexCommandEvent(
+            command='rg -n "foo" src',
+            cwd="/workspace",
+            status="in_progress",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="cmd-1",
+            display_commands=('rg -n "foo" src',),
+        ),
+        CodexCommandEvent(
+            command="sed -n '1,20p' README.md",
+            cwd="/workspace",
+            status="in_progress",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="cmd-2",
+            display_commands=("sed -n '1,20p' README.md",),
+        ),
+        CodexTextMessageEvent(
+            channel="agentMessage",
+            text="最终回答",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="msg-1",
+        ),
+        CodexTurnLifecycleEvent(
+            phase="completed",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            status="completed",
+            error=None,
+        ),
+    )
+    service = ReplyService(
+        _build_config(tmp_path),
+        feishu_adapter=feishu_adapter,
+        reply_repository=reply_repository,
+        session_executor=session_executor,
+        classifier=classifier,
+    )
+
+    async def _run() -> None:
+        await service.start_turn(
+            session_scope_key="p2p:ou_owner",
+            source_message_id="om_source",
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
+        await service.handle_notification(
+            CodexNotification(
+                method="test.notification",
+                params={},
+                thread_id="thread-1",
+                turn_id="turn-1",
+                item_id=None,
+                request_id=None,
+            )
+        )
+
+    asyncio.run(_run())
+
+    merged_notice = (
+        "<font color='grey-500'>正在执行命令：</font>\n"
+        "> <font color='grey-500'>rg -n \"foo\" src</font>\n"
+        "> <font color='grey-500'>sed -n '1,20p' README.md</font>"
+    )
+    assert feishu_adapter.reply_cards == [
+        {
+            "message_id": "om_source",
+            "text": "<font color='grey-500'>正在执行命令：</font>\n> <font color='grey-500'>rg -n \"foo\" src</font>",
+            "reply_in_thread": False,
+            "status": "streaming",
+        }
+    ]
+    assert feishu_adapter.card_updates == [
+        {
+            "card_id": "card-1",
+            "text": f"{merged_notice}\n\n最终回答",
+            "status": "completed",
+            "sequence": 2,
+        },
+    ]
+
+
+def test_reply_service_starts_new_command_header_after_text_block(tmp_path: Path) -> None:
+    feishu_adapter = _FakeFeishuAdapter()
+    reply_repository = _FakeReplyRepository()
+    session_executor = _FakeSessionExecutor()
+    classifier = _FakeClassifier(
+        CodexCommandEvent(
+            command="pwd",
+            cwd="/workspace",
+            status="in_progress",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="cmd-1",
+            display_commands=("pwd",),
+        ),
+        CodexTextMessageEvent(
+            channel="agentMessage",
+            text="中间说明",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="msg-1",
+        ),
+        CodexCommandEvent(
+            command="ls -la",
+            cwd="/workspace",
+            status="in_progress",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="cmd-2",
+            display_commands=("ls -la",),
+        ),
+        CodexTurnLifecycleEvent(
+            phase="completed",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            status="completed",
+            error=None,
+        ),
+    )
+    service = ReplyService(
+        _build_config(tmp_path),
+        feishu_adapter=feishu_adapter,
+        reply_repository=reply_repository,
+        session_executor=session_executor,
+        classifier=classifier,
+    )
+
+    async def _run() -> None:
+        await service.start_turn(
+            session_scope_key="p2p:ou_owner",
+            source_message_id="om_source",
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
+        await service.handle_notification(
+            CodexNotification(
+                method="test.notification",
+                params={},
+                thread_id="thread-1",
+                turn_id="turn-1",
+                item_id=None,
+                request_id=None,
+            )
+        )
+
+    asyncio.run(_run())
+
+    first_notice = "<font color='grey-500'>正在执行命令：</font>\n> <font color='grey-500'>pwd</font>"
+    second_notice = "<font color='grey-500'>正在执行命令：</font>\n> <font color='grey-500'>ls -la</font>"
+    assert feishu_adapter.reply_cards == [
+        {
+            "message_id": "om_source",
+            "text": first_notice,
+            "reply_in_thread": False,
+            "status": "streaming",
+        }
+    ]
+    assert feishu_adapter.card_updates == [
+        {
+            "card_id": "card-1",
+            "text": f"{first_notice}\n\n中间说明\n\n{second_notice}",
+            "status": "completed",
+            "sequence": 2,
+        },
+    ]
+
+
+def test_reply_service_only_appends_new_agent_text_around_command_blocks(tmp_path: Path) -> None:
+    feishu_adapter = _FakeFeishuAdapter()
+    reply_repository = _FakeReplyRepository()
+    session_executor = _FakeSessionExecutor()
+    classifier = _FakeClassifier(
+        CodexTextMessageEvent(
+            channel="agentMessage",
+            text="我先查看 README。",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="msg-1",
+        ),
+        CodexCommandEvent(
+            command="pwd",
+            cwd="/workspace",
+            status="in_progress",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="cmd-1",
+            display_commands=("pwd",),
+        ),
+        CodexCommandEvent(
+            command="rg --files -g 'README*'",
+            cwd="/workspace",
+            status="in_progress",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="cmd-2",
+            display_commands=("rg --files -g 'README*'",),
+        ),
+        CodexTextMessageEvent(
+            channel="agentMessage",
+            text="我先查看 README。仓库里只有根目录 README.md。",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="msg-1",
+        ),
+        CodexCommandEvent(
+            command="sed -n '1,260p' README.md",
+            cwd="/workspace",
+            status="in_progress",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="cmd-3",
+            display_commands=("sed -n '1,260p' README.md",),
+        ),
+        CodexTextMessageEvent(
+            channel="agentMessage",
+            text="我先查看 README。仓库里只有根目录 README.md。README 主要说明了仓库用途。",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="msg-1",
+        ),
+        CodexTurnLifecycleEvent(
+            phase="completed",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            status="completed",
+            error=None,
+        ),
+    )
+    service = ReplyService(
+        _build_config(tmp_path),
+        feishu_adapter=feishu_adapter,
+        reply_repository=reply_repository,
+        session_executor=session_executor,
+        classifier=classifier,
+    )
+
+    async def _run() -> None:
+        await service.start_turn(
+            session_scope_key="p2p:ou_owner",
+            source_message_id="om_source",
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
+        await service.handle_notification(
+            CodexNotification(
+                method="test.notification",
+                params={},
+                thread_id="thread-1",
+                turn_id="turn-1",
+                item_id=None,
+                request_id=None,
+            )
+        )
+
+    asyncio.run(_run())
+
+    first_notice = (
+        "<font color='grey-500'>正在执行命令：</font>\n"
+        "> <font color='grey-500'>pwd</font>\n"
+        "> <font color='grey-500'>rg --files -g 'README*'</font>"
+    )
+    second_notice = (
+        "<font color='grey-500'>正在执行命令：</font>\n"
+        "> <font color='grey-500'>sed -n '1,260p' README.md</font>"
+    )
+    expected_text = (
+        "我先查看 README。\n\n"
+        f"{first_notice}\n\n"
+        "仓库里只有根目录 README.md。\n\n"
+        f"{second_notice}\n\n"
+        "README 主要说明了仓库用途。"
+    )
+    assert feishu_adapter.reply_cards == [
+        {
+            "message_id": "om_source",
+            "text": "我先查看 README。",
+            "reply_in_thread": False,
+            "status": "streaming",
+        }
+    ]
+    assert feishu_adapter.card_updates == [
+        {
+            "card_id": "card-1",
+            "text": expected_text,
+            "status": "completed",
+            "sequence": 2,
+        },
+    ]
+
+
+def test_reply_service_preserves_distinct_agent_message_blocks_between_commands(
+    tmp_path: Path,
+) -> None:
+    feishu_adapter = _FakeFeishuAdapter()
+    reply_repository = _FakeReplyRepository()
+    session_executor = _FakeSessionExecutor()
+    classifier = _FakeClassifier(
+        CodexTextMessageEvent(
+            channel="agentMessage",
+            text="先检查仓库里的 README 文件内容，再给你一个压缩总结。",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="msg-1",
+        ),
+        CodexCommandEvent(
+            command="pwd",
+            cwd="/workspace",
+            status="in_progress",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="cmd-1",
+            display_commands=("pwd",),
+        ),
+        CodexCommandEvent(
+            command="rg --files -g 'README*' -g 'readme*'",
+            cwd="/workspace",
+            status="in_progress",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="cmd-2",
+            display_commands=("rg --files -g 'README*' -g 'readme*'",),
+        ),
+        CodexTextMessageEvent(
+            channel="agentMessage",
+            text="README 只有一个根目录文件。我现在把正文读一遍。",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="msg-2",
+        ),
+        CodexCommandEvent(
+            command="sed -n '1,260p' README.md",
+            cwd="/workspace",
+            status="in_progress",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="cmd-3",
+            display_commands=("sed -n '1,260p' README.md",),
+        ),
+        CodexTextMessageEvent(
+            channel="agentMessage",
+            text="当前 README 的核心内容可以概括为这些。",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="msg-3",
+        ),
+        CodexTurnLifecycleEvent(
+            phase="completed",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            status="completed",
+            error=None,
+        ),
+    )
+    service = ReplyService(
+        _build_config(tmp_path),
+        feishu_adapter=feishu_adapter,
+        reply_repository=reply_repository,
+        session_executor=session_executor,
+        classifier=classifier,
+    )
+
+    async def _run() -> None:
+        await service.start_turn(
+            session_scope_key="p2p:ou_owner",
+            source_message_id="om_source",
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
+        await service.handle_notification(
+            CodexNotification(
+                method="test.notification",
+                params={},
+                thread_id="thread-1",
+                turn_id="turn-1",
+                item_id=None,
+                request_id=None,
+            )
+        )
+
+    asyncio.run(_run())
+
+    first_notice = (
+        "<font color='grey-500'>正在执行命令：</font>\n"
+        "> <font color='grey-500'>pwd</font>\n"
+        "> <font color='grey-500'>rg --files -g 'README*' -g 'readme*'</font>"
+    )
+    second_notice = (
+        "<font color='grey-500'>正在执行命令：</font>\n"
+        "> <font color='grey-500'>sed -n '1,260p' README.md</font>"
+    )
+    expected_text = (
+        "先检查仓库里的 README 文件内容，再给你一个压缩总结。\n\n"
+        f"{first_notice}\n\n"
+        "README 只有一个根目录文件。我现在把正文读一遍。\n\n"
+        f"{second_notice}\n\n"
+        "当前 README 的核心内容可以概括为这些。"
+    )
+    assert feishu_adapter.reply_cards == [
+        {
+            "message_id": "om_source",
+            "text": "先检查仓库里的 README 文件内容，再给你一个压缩总结。",
+            "reply_in_thread": False,
+            "status": "streaming",
+        }
+    ]
+    assert feishu_adapter.card_updates == [
+        {
+            "card_id": "card-1",
+            "text": expected_text,
+            "status": "completed",
+            "sequence": 2,
+        },
+    ]
 
 
 def test_reply_service_fail_turn_updates_failed_card(tmp_path: Path) -> None:
