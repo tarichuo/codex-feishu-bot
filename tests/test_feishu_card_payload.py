@@ -58,7 +58,10 @@ from feishu_codex_bot.models.inbound import ImageContent, TextContent
 def test_streaming_card_status_uses_markdown_icon_structure() -> None:
     adapter = FeishuAdapter.__new__(FeishuAdapter)
 
-    payload = adapter._build_streaming_card_payload(text="正文", status="completed")
+    payload = adapter._build_streaming_card_payload(
+        text="正文",
+        status="completed",
+    )
 
     elements = payload["body"]["elements"]
     assert len(elements) == 2
@@ -72,6 +75,21 @@ def test_streaming_card_status_uses_markdown_icon_structure() -> None:
         "color": "grey-500",
     }
     assert "<i token=" not in status_element["content"]
+
+
+def test_failure_card_payload_uses_red_header_and_error_body() -> None:
+    adapter = FeishuAdapter.__new__(FeishuAdapter)
+
+    payload = adapter._build_failure_card_payload(error_text="错误原因：模型服务断开。")
+
+    assert payload["header"]["title"]["content"] == "执行失败"
+    assert payload["header"]["template"] == "red"
+    assert payload["body"]["elements"] == [
+        {
+            "tag": "markdown",
+            "content": "错误原因：模型服务断开。",
+        }
+    ]
 
 
 def test_extract_post_parts_supports_top_level_post_content_with_images() -> None:

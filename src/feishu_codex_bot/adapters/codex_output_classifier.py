@@ -14,6 +14,7 @@ from feishu_codex_bot.models.actions import (
     CodexServerRequest,
     CodexTextDeltaEvent,
     CodexTextMessageEvent,
+    CodexTurnErrorEvent,
     CodexTurnLifecycleEvent,
     CodexUnknownEvent,
     CodexUserInputRequestEvent,
@@ -127,6 +128,20 @@ class CodexOutputClassifier:
                     diff=delta if isinstance(delta, str) else None,
                 ),
             )
+
+        if notification.method == "error":
+            error = notification.params.get("error")
+            will_retry = notification.params.get("willRetry")
+            if isinstance(error, dict):
+                return (
+                    CodexTurnErrorEvent(
+                        error=dict(error),
+                        thread_id=notification.thread_id,
+                        turn_id=notification.turn_id,
+                        item_id=notification.item_id,
+                        will_retry=will_retry if isinstance(will_retry, bool) else None,
+                    ),
+                )
 
         if notification.method == "turn/started":
             turn = notification.params.get("turn")

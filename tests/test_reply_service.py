@@ -16,7 +16,12 @@ from feishu_codex_bot.config import (
     SecurityConfig,
     StorageConfig,
 )
-from feishu_codex_bot.models.actions import CodexNotification, CodexTextDeltaEvent, CodexTurnLifecycleEvent
+from feishu_codex_bot.models.actions import (
+    CodexNotification,
+    CodexTextDeltaEvent,
+    CodexTurnErrorEvent,
+    CodexTurnLifecycleEvent,
+)
 
 _feishu_adapter_stub = types.ModuleType("feishu_codex_bot.adapters.feishu_adapter")
 _feishu_adapter_stub.FeishuAdapter = object
@@ -44,6 +49,7 @@ class _FakeReplyRecord:
 class _FakeFeishuAdapter:
     def __init__(self) -> None:
         self.reply_cards: list[dict[str, object]] = []
+        self.failure_cards: list[dict[str, object]] = []
         self.card_updates: list[dict[str, object]] = []
         self.card_streaming_modes: list[dict[str, object]] = []
         self.added_reactions: list[dict[str, str]] = []
@@ -65,6 +71,25 @@ class _FakeFeishuAdapter:
         }
         self.reply_cards.append(call)
         index = len(self.reply_cards)
+        return _FakeReplyCardRef(
+            message_id=f"reply-message-{index}",
+            card_id=f"card-{index}",
+        )
+
+    def reply_failure_card(
+        self,
+        *,
+        message_id: str,
+        error_text: str,
+        reply_in_thread: bool = False,
+    ) -> _FakeReplyCardRef:
+        call = {
+            "message_id": message_id,
+            "error_text": error_text,
+            "reply_in_thread": reply_in_thread,
+        }
+        self.failure_cards.append(call)
+        index = len(self.reply_cards) + len(self.failure_cards)
         return _FakeReplyCardRef(
             message_id=f"reply-message-{index}",
             card_id=f"card-{index}",
@@ -320,6 +345,7 @@ def test_reply_service_fail_turn_updates_failed_card(tmp_path: Path) -> None:
         }
     ]
     assert session_executor.completed == [("p2p:ou_owner", "turn-1")]
+    assert feishu_adapter.failure_cards == []
 
 
 def test_reply_service_starts_new_card_after_approval_followup(tmp_path: Path) -> None:
@@ -473,3 +499,73 @@ def test_reply_service_caps_update_rate_at_ten_per_second(tmp_path: Path) -> Non
     )
 
     assert service._update_interval_seconds == 0.1
+
+
+def test_reply_service_sends_failure_card_when_turn_fails_before_any_reply(tmp_path: Path) -> None:
+    feishu_adapter = _FakeFeishuAdapter()
+    reply_repository = _FakeReplyRepository()
+    session_executor = _FakeSessionExecutor()
+    classifier = _FakeClassifier(
+        CodexTurnErrorEvent(
+            error={
+                "message": "The model server disconnected.",
+                "additionalDetails": "response stream closed unexpectedly",
+            },
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id=None,
+            will_retry=False,
+        ),
+        CodexTurnLifecycleEvent(
+            phase="completed",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            status="failed",
+            error={
+                "message": "The model server disconnected.",
+                "additionalDetails": "response stream closed unexpectedly",
+            },
+        ),
+    )
+    service = ReplyService(
+        _build_config(tmp_path),
+        feishu_adapter=feishu_adapter,
+        reply_repository=reply_repository,
+        session_executor=session_executor,
+        classifier=classifier,
+    )
+
+    async def _run() -> None:
+        await service.start_turn(
+            session_scope_key="p2p:ou_owner",
+            source_message_id="om_source",
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
+        await service.handle_notification(
+            CodexNotification(
+                method="notification.failed",
+                params={},
+                thread_id="thread-1",
+                turn_id="turn-1",
+                item_id=None,
+                request_id=None,
+            )
+        )
+
+    asyncio.run(_run())
+
+    assert feishu_adapter.reply_cards == []
+    assert feishu_adapter.failure_cards == [
+        {
+            "message_id": "om_source",
+            "error_text": (
+                "错误原因：The model server disconnected.\n\n"
+                "附加信息：response stream closed unexpectedly"
+            ),
+            "reply_in_thread": False,
+        }
+    ]
+    assert feishu_adapter.card_updates == []
+    assert feishu_adapter.card_streaming_modes == []
+    assert reply_repository.records["reply-message-1"].status == "failed"

@@ -16,6 +16,7 @@ from feishu_codex_bot.models.actions import (
     CodexOutputEvent,
     CodexTextDeltaEvent,
     CodexTextMessageEvent,
+    CodexTurnErrorEvent,
     CodexTurnLifecycleEvent,
 )
 from feishu_codex_bot.persistence.reply_repo import ReplyMessageRecord, ReplyRepository
@@ -48,6 +49,7 @@ class _ReplyStreamState:
     last_sent_text: str
     next_sequence: int
     aggregated_text: str = ""
+    latest_error_text: str | None = None
     agent_item_id: str | None = None
     status: ReplyStreamStatus = "streaming"
     flush_task: asyncio.Task[None] | None = None
@@ -228,6 +230,7 @@ class ReplyService:
             state.last_sent_text = ""
             state.next_sequence = 0
             state.aggregated_text = ""
+            state.latest_error_text = None
             state.agent_item_id = None
             state.status = "streaming"
             state.dirty = False
@@ -276,12 +279,30 @@ class ReplyService:
             await self._replace_text(state, event.text, item_id=event.item_id)
             return True
 
+        if isinstance(event, CodexTurnErrorEvent):
+            formatted_error_text = self._format_error_text(event.error, will_retry=event.will_retry)
+            async with state.lock:
+                if state.closed:
+                    return False
+                state.latest_error_text = formatted_error_text
+            self._logger.bind(
+                event="reply.codex_turn_error",
+                session_scope_key=state.session_scope_key,
+                turn_id=state.turn_id,
+                thread_id=state.thread_id,
+                item_id=event.item_id,
+                will_retry=event.will_retry,
+                error_text=formatted_error_text,
+                error=event.error,
+            ).info("Cached Codex turn error for reply fallback")
+            return False
+
         if isinstance(event, CodexTurnLifecycleEvent) and event.phase == "completed":
             if event.error:
                 await self._finalize_state(
                     state,
                     status="failed",
-                    fallback_text=self._failure_text,
+                    fallback_text=self._format_error_text(event.error),
                 )
             else:
                 await self._finalize_state(state, status="completed")
@@ -298,6 +319,17 @@ class ReplyService:
     ) -> None:
         if not text:
             return
+        self._logger.bind(
+            event="reply.codex_raw_output",
+            log_keyword="CODEX_RAW_OUTPUT",
+            session_scope_key=state.session_scope_key,
+            turn_id=state.turn_id,
+            thread_id=state.thread_id,
+            item_id=item_id,
+            event_kind="delta",
+            text_length=len(text),
+            text=text,
+        ).info("CODEX_RAW_OUTPUT")
         async with state.lock:
             if state.closed:
                 return
@@ -321,6 +353,17 @@ class ReplyService:
         *,
         item_id: str | None,
     ) -> None:
+        self._logger.bind(
+            event="reply.codex_raw_output",
+            log_keyword="CODEX_RAW_OUTPUT",
+            session_scope_key=state.session_scope_key,
+            turn_id=state.turn_id,
+            thread_id=state.thread_id,
+            item_id=item_id,
+            event_kind="message",
+            text_length=len(text),
+            text=text,
+        ).info("CODEX_RAW_OUTPUT")
         async with state.lock:
             if state.closed:
                 return
@@ -370,7 +413,7 @@ class ReplyService:
                 if not state.aggregated_text:
                     return
                 create_reply_card = True
-                target_text = state.aggregated_text
+                target_text = state.aggregated_text or state.placeholder_text
                 status = state.status
                 source_message_id = state.source_message_id
                 reply_in_thread = state.reply_in_thread
@@ -479,12 +522,33 @@ class ReplyService:
             force=force,
         ).info("Flushed reply text to Feishu")
 
+    def _format_error_text(self, error: dict[str, object], *, will_retry: bool | None = None) -> str:
+        message = error.get("message")
+        primary_message = str(message).strip() if message is not None else ""
+        if not primary_message:
+            primary_message = self._failure_text
+
+        sections = [f"错误原因：{primary_message}"]
+
+        additional_details = error.get("additionalDetails")
+        if isinstance(additional_details, str) and additional_details.strip():
+            sections.append(f"附加信息：{additional_details.strip()}")
+
+        codex_error_info = error.get("codexErrorInfo")
+        if codex_error_info is not None:
+            sections.append(f"错误类型：{codex_error_info}")
+
+        if will_retry is not None:
+            sections.append(f"是否重试：{'是' if will_retry else '否'}")
+
+        return "\n\n".join(sections)
+
     async def _close_streaming_card(self, state: _ReplyStreamState) -> None:
         async with state.lock:
             if state.closed:
                 return
             card_id = state.reply_card_id
-            if card_id is None:
+            if card_id is None or state.next_sequence <= 0:
                 return
             sequence = state.next_sequence
 
@@ -546,6 +610,7 @@ class ReplyService:
         fallback_text: str | None = None,
     ) -> None:
         flush_task: asyncio.Task[None] | None = None
+        effective_fallback_text = self._failure_text
         async with state.lock:
             if state.closed:
                 return
@@ -554,8 +619,9 @@ class ReplyService:
             state.flush_task = None
             if flush_task is not None:
                 flush_task.cancel()
-            if fallback_text and not state.aggregated_text and state.reply_card_id is not None:
-                state.aggregated_text = fallback_text
+            effective_fallback_text = fallback_text or state.latest_error_text or self._failure_text
+            if effective_fallback_text and not state.aggregated_text and state.reply_card_id is not None:
+                state.aggregated_text = effective_fallback_text
             state.dirty = True
 
         if flush_task is not None:
@@ -564,17 +630,77 @@ class ReplyService:
             except asyncio.CancelledError:
                 pass
 
-        try:
-            await self._flush_state(state, force=True)
-        except Exception:
-            self._logger.bind(
-                event="reply.finalize.flush_failed",
-                session_scope_key=state.session_scope_key,
-                reply_message_id=state.reply_message_id,
-                reply_card_id=state.reply_card_id,
-                turn_id=state.turn_id,
-                status=status,
-            ).exception("Failed to flush final reply text")
+        if status == "failed":
+            async with state.lock:
+                should_send_failure_card = state.reply_card_id is None
+                source_message_id = state.source_message_id
+                reply_in_thread = state.reply_in_thread
+            if should_send_failure_card:
+                try:
+                    reply_card = self._feishu_adapter.reply_failure_card(
+                        message_id=source_message_id,
+                        error_text=effective_fallback_text,
+                        reply_in_thread=reply_in_thread,
+                    )
+                    self._reply_repository.create_reply(
+                        bot_app_id=self._config.feishu.app_id,
+                        feishu_message_id=source_message_id,
+                        reply_message_id=reply_card.message_id,
+                        thread_id=state.thread_id,
+                        turn_id=state.turn_id,
+                        agent_item_id=state.agent_item_id,
+                        status=status,
+                        reaction_applied=state.reaction_id is not None,
+                    )
+                    async with state.lock:
+                        if not state.closed:
+                            state.reply_message_id = reply_card.message_id
+                            state.reply_card_id = reply_card.card_id
+                            state.aggregated_text = effective_fallback_text
+                            state.last_sent_text = effective_fallback_text
+                            state.next_sequence = 0
+                            state.dirty = False
+                    self._logger.bind(
+                        event="reply.failure_card.sent",
+                        session_scope_key=state.session_scope_key,
+                        source_message_id=source_message_id,
+                        reply_message_id=reply_card.message_id,
+                        reply_card_id=reply_card.card_id,
+                        turn_id=state.turn_id,
+                        error_text=effective_fallback_text,
+                    ).info("Sent Feishu failure card for failed turn without prior reply")
+                except Exception:
+                    self._logger.bind(
+                        event="reply.failure_card.send_failed",
+                        session_scope_key=state.session_scope_key,
+                        source_message_id=source_message_id,
+                        turn_id=state.turn_id,
+                        error_text=effective_fallback_text,
+                    ).exception("Failed to send Feishu failure card")
+            else:
+                try:
+                    await self._flush_state(state, force=True)
+                except Exception:
+                    self._logger.bind(
+                        event="reply.finalize.flush_failed",
+                        session_scope_key=state.session_scope_key,
+                        reply_message_id=state.reply_message_id,
+                        reply_card_id=state.reply_card_id,
+                        turn_id=state.turn_id,
+                        status=status,
+                    ).exception("Failed to flush final reply text")
+        else:
+            try:
+                await self._flush_state(state, force=True)
+            except Exception:
+                self._logger.bind(
+                    event="reply.finalize.flush_failed",
+                    session_scope_key=state.session_scope_key,
+                    reply_message_id=state.reply_message_id,
+                    reply_card_id=state.reply_card_id,
+                    turn_id=state.turn_id,
+                    status=status,
+                ).exception("Failed to flush final reply text")
 
         try:
             await self._close_streaming_card(state)

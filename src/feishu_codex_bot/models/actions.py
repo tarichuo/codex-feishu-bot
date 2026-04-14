@@ -448,6 +448,19 @@ class CodexImageOutputEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class CodexTurnErrorEvent:
+    error: JsonObject
+    thread_id: str | None
+    turn_id: str | None
+    item_id: str | None
+    will_retry: bool | None = None
+
+    @property
+    def kind(self) -> str:
+        return "turn_error"
+
+
+@dataclass(frozen=True, slots=True)
 class CodexApprovalRequestEvent:
     request_id: RequestId
     approval_type: str
@@ -507,6 +520,7 @@ CodexOutputEvent: TypeAlias = (
     | CodexCommandEvent
     | CodexFileReferenceEvent
     | CodexImageOutputEvent
+    | CodexTurnErrorEvent
     | CodexApprovalRequestEvent
     | CodexUserInputRequestEvent
     | CodexTurnLifecycleEvent

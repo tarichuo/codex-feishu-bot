@@ -318,6 +318,31 @@ class FeishuAdapter:
             reply_in_thread=reply_in_thread,
         )
 
+    def reply_failure_card(
+        self,
+        *,
+        message_id: str,
+        error_text: str,
+        reply_in_thread: bool = False,
+    ) -> FeishuReplyCardRef:
+        card_id = self.create_structured_card(
+            card_payload=self._build_failure_card_payload(error_text=error_text)
+        )
+        reply_message_id = self._reply_message(
+            message_id=message_id,
+            msg_type="interactive",
+            content=self._json_content(
+                {
+                    "type": "card",
+                    "data": {
+                        "card_id": card_id,
+                    },
+                }
+            ),
+            reply_in_thread=reply_in_thread,
+        )
+        return FeishuReplyCardRef(message_id=reply_message_id, card_id=card_id)
+
     def reply_file(
         self,
         *,
@@ -1143,7 +1168,12 @@ class FeishuAdapter:
     def _json_content(self, payload: dict[str, object]) -> str:
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
-    def _build_streaming_card_payload(self, *, text: str, status: str) -> dict[str, object]:
+    def _build_streaming_card_payload(
+        self,
+        *,
+        text: str,
+        status: str,
+    ) -> dict[str, object]:
         return {
             "schema": "2.0",
             "config": {
@@ -1186,6 +1216,35 @@ class FeishuAdapter:
         }.get(status, "处理中")
         return f"<font color='grey-500'>{status_text}</font>"
 
+    def _build_failure_card_payload(self, *, error_text: str) -> dict[str, object]:
+        return {
+            "schema": "2.0",
+            "config": {
+                "wide_screen_mode": True,
+            },
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": "执行失败",
+                },
+                "template": "red",
+            },
+            "body": {
+                "direction": "vertical",
+                "padding": "12px 12px 12px 12px",
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": self._build_failure_card_content(error_text=error_text),
+                    }
+                ],
+            },
+        }
+
+    def _build_failure_card_content(self, *, error_text: str) -> str:
+        normalized_text = error_text.strip() if error_text.strip() else "本次回复失败，未返回可展示的详细原因。"
+        return normalized_text
+
     def _update_card_element_content(
         self,
         *,
@@ -1197,11 +1256,13 @@ class FeishuAdapter:
         start_time = time.perf_counter()
         self._logger.bind(
             event="feishu.card.content.request",
+            log_keyword="FEISHU_CARD_CONTENT",
             card_id=card_id,
             element_id=element_id,
             request_content=content,
             sequence=sequence,
-        ).info("Updating Feishu streaming card content")
+            content=content,
+        ).info("FEISHU_CARD_CONTENT")
         try:
             response = self._client.cardkit.v1.card_element.content(
                 ContentCardElementRequest.builder()

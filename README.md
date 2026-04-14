@@ -12,6 +12,8 @@
 - 支持非白名单用户拦截与 owner 告警
 - 支持 Codex 审批请求和补充输入的飞书文本协议桥接
 
+主流程时序图见：[docs/main_sequence.md](docs/main_sequence.md)
+
 ## 前置条件
 ### CODEX
 1. 需要在本地配置好codex的cli环境，能正常工作。当前适配版本为codex-cli 0.120.0
